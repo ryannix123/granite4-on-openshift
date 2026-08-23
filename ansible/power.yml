@@ -1,0 +1,426 @@
+---
+# power.yml - Start and stop the OLS / model-serving stack to reclaim RAM
+#             and the GPU on a resource-constrained SNO node.
+#
+# Nothing here is destructive to configuration: every "down" action deletes
+# only custom resources whose full definition lives in ../manifests/. The
+# matching "up" action re-applies those same files. Operators, CRDs, the
+# GPU driver, and the node's cached model image are all left alone, which
+# is why bringing the stack back up takes minutes rather than the
+# forty-plus minutes of a from-scratch deploy.yml run.
+#
+# Usage:
+#   # See what's running and what it costs, change nothing:
+#   ansible-playbook -i inventory/hosts.ini power.yml
+#
+#   # Free the GPU and ~12-16Gi by stopping the model only:
+#   ansible-playbook -i inventory/hosts.ini power.yml -e state=down -e scope=model
+#
+#   # Also stop OLS (app server, Postgres, Solr/RHOKP)  [default scope]
+#   ansible-playbook -i inventory/hosts.ini power.yml -e state=down
+#
+#   # Also tear down the DataScienceCluster (KServe controllers, dashboard)
+#   ansible-playbook -i inventory/hosts.ini power.yml -e state=down -e scope=rhoai
+#
+#   # Bring everything back, in dependency order:
+#   ansible-playbook -i inventory/hosts.ini power.yml -e state=up
+#
+# scope is a ladder, not a set. Each level includes the ones below it:
+#   model  ->  InferenceService only
+#   ols    ->  OLSConfig + InferenceService              (default)
+#   rhoai  ->  DataScienceCluster + OLSConfig + InferenceService
+#
+# `state=up` always restores the full stack regardless of scope, applying
+# only what is actually missing. There is no sensible reason to bring the
+# model back up but leave OLS pointing at nothing.
+
+- name: "Power the OLS + model serving stack up or down"
+  hosts: local
+  gather_facts: false
+
+  vars:
+    state: status          # status | up | down
+    scope: ols             # model | ols | rhoai
+
+    ols_namespace: "openshift-lightspeed"
+    rhoai_apps_namespace: "redhat-ods-applications"
+    dsc_name: "default-dsc"
+
+    # Seconds to wait for workloads to drain / come back.
+    timeout_drain: 180
+    timeout_restore: 600
+
+  tasks:
+
+    ############################################################################
+    # PREFLIGHT
+    ############################################################################
+
+    - name: "Preflight | Validate the state argument"
+      ansible.builtin.fail:
+        msg: |
+          state must be one of: status, up, down (got "{{ state }}").
+          Examples:
+            -e state=down            stop OLS + model
+            -e state=down -e scope=rhoai   also tear down the DSC
+            -e state=up              bring everything back
+      when: state not in ['status', 'up', 'down']
+      tags: [always]
+
+    - name: "Preflight | Validate the scope argument"
+      ansible.builtin.fail:
+        msg: 'scope must be one of: model, ols, rhoai (got "{{ scope }}").'
+      when: scope not in ['model', 'ols', 'rhoai']
+      tags: [always]
+
+    - name: "Preflight | Verify logged in"
+      ansible.builtin.command:
+        cmd: oc whoami
+      register: oc_whoami
+      changed_when: false
+      failed_when: oc_whoami.rc != 0
+      check_mode: false
+      tags: [always]
+
+    - name: "Preflight | Resolve which tiers this scope covers"
+      ansible.builtin.set_fact:
+        # The ladder: rhoai implies ols implies model.
+        touch_model: true
+        touch_ols: "{{ scope in ['ols', 'rhoai'] }}"
+        touch_dsc: "{{ scope == 'rhoai' }}"
+      tags: [always]
+
+
+    ############################################################################
+    # STATUS — read-only. Runs for every state so `up` and `down` both
+    # print a before/after picture rather than leaving you guessing.
+    ############################################################################
+
+    - name: "Status | Node memory and CPU"
+      ansible.builtin.command:
+        cmd: oc adm top node --no-headers
+      register: node_top
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "Status | Predictor pods"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - pod
+          - -n
+          - "{{ serving_namespace }}"
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}'
+      register: model_pods
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "Status | OLS pods"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - pod
+          - -n
+          - "{{ ols_namespace }}"
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}'
+      register: ols_pods
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "Status | RHOAI application pods"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - pod
+          - -n
+          - "{{ rhoai_apps_namespace }}"
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}'
+      register: rhoai_pods
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "Status | Report"
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════════════════"
+          - "Node:  {{ node_top.stdout_lines | default(['(metrics unavailable)'], true) | join(' | ') }}"
+          - "────────────────────────────────────────────────────────────"
+          - "Model serving ({{ serving_namespace }}): {{ model_pods.stdout_lines | default([], true) | length }} pod(s)"
+          - "{{ model_pods.stdout_lines | default(['  (none)'], true) }}"
+          - "OpenShift Lightspeed ({{ ols_namespace }}): {{ ols_pods.stdout_lines | default([], true) | length }} pod(s)"
+          - "{{ ols_pods.stdout_lines | default(['  (none)'], true) }}"
+          - "RHOAI applications ({{ rhoai_apps_namespace }}): {{ rhoai_pods.stdout_lines | default([], true) | length }} pod(s)"
+          - "{{ rhoai_pods.stdout_lines | default(['  (none)'], true) }}"
+          - "════════════════════════════════════════════════════════════"
+      tags: [always]
+
+    - name: "Status | Nothing further to do"
+      ansible.builtin.debug:
+        msg: >-
+          Read-only run. Pass -e state=down to stop the stack,
+          or -e state=up to start it.
+      when: state == 'status'
+      tags: [always]
+
+
+    ############################################################################
+    # DOWN — highest layer first, so nothing is left reconciling against a
+    # dependency that has already gone away.
+    ############################################################################
+
+    - name: "Down"
+      when: state == 'down'
+      tags: [always]
+      block:
+
+        # OLS first: the app server holds an open connection to the
+        # predictor, and the Lightspeed operator will happily recreate
+        # anything you scale by hand. Deleting the OLSConfig CR is what
+        # actually tells the operator to stand its workloads down.
+        - name: "Down | Remove OLSConfig (stops app server, Postgres, Solr/RHOKP)"
+          ansible.builtin.command:
+            cmd: oc delete olsconfig cluster --ignore-not-found
+          register: ols_del
+          changed_when: "'deleted' in ols_del.stdout"
+          when: touch_ols | bool
+
+        - name: "Down | Wait for OLS workloads to drain"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - pod
+              - -n
+              - "{{ ols_namespace }}"
+              - -l
+              - app.kubernetes.io/part-of=lightspeed-service
+              - -o
+              - name
+          register: ols_drain
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          until: (ols_drain.stdout | trim | length) == 0
+          retries: "{{ (timeout_drain | int / 10) | int }}"
+          delay: 10
+          when:
+            - touch_ols | bool
+            - not ansible_check_mode
+
+        # The InferenceService is what holds the GPU and the 12-16Gi
+        # request. KServe resets a hand-scaled Deployment back to
+        # minReplicas, so deleting the CR is the reliable lever.
+        - name: "Down | Remove InferenceService (frees the GPU and its memory)"
+          ansible.builtin.command:
+            cmd: >-
+              oc delete inferenceservice {{ inferenceservice_name }}
+              -n {{ serving_namespace }} --ignore-not-found
+          register: isvc_del
+          changed_when: "'deleted' in isvc_del.stdout"
+
+        - name: "Down | Wait for the predictor pod to terminate"
+          ansible.builtin.command:
+            cmd: >-
+              oc get pod -n {{ serving_namespace }}
+              -l serving.kserve.io/inferenceservice={{ inferenceservice_name }}
+              -o name
+          register: model_drain
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          until: (model_drain.stdout | trim | length) == 0
+          retries: "{{ (timeout_drain | int / 10) | int }}"
+          delay: 10
+          when: not ansible_check_mode
+
+        - name: "Down | Remove DataScienceCluster (stops KServe controllers, dashboard)"
+          ansible.builtin.command:
+            cmd: "oc delete datasciencecluster {{ dsc_name }} --ignore-not-found"
+          register: dsc_del
+          changed_when: "'deleted' in dsc_del.stdout"
+          when: touch_dsc | bool
+
+        - name: "Down | Wait for RHOAI application workloads to drain"
+          ansible.builtin.command:
+            cmd: "oc get pod -n {{ rhoai_apps_namespace }} -o name"
+          register: rhoai_drain
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          until: (rhoai_drain.stdout | trim | length) == 0
+          retries: "{{ (timeout_drain | int / 10) | int }}"
+          delay: 10
+          when:
+            - touch_dsc | bool
+            - not ansible_check_mode
+
+        - name: "Down | Stopped"
+          ansible.builtin.debug:
+            msg:
+              - "✓ Stack stopped at scope '{{ scope }}'."
+              - "  Model serving:  stopped (GPU released)"
+              - "  OpenShift AI:   {{ 'DataScienceCluster removed' if touch_dsc | bool else 'left running' }}"
+              - "  Lightspeed:     {{ 'stopped' if touch_ols | bool else 'left running' }}"
+              - ""
+              - "Still running (deliberately): the four operators, the NVIDIA"
+              - "driver daemonset, and NFD. Those are small, and stopping the"
+              - "driver would mean rebuilding it on next start."
+              - ""
+              - "Restore with:"
+              - "  ansible-playbook -i inventory/hosts.ini power.yml -e state=up"
+
+
+    ############################################################################
+    # UP — reverse order, applying only what's missing. Always restores the
+    # whole stack: a running model with no OLS in front of it isn't a state
+    # worth having.
+    ############################################################################
+
+    - name: "Up"
+      when: state == 'up'
+      tags: [always]
+      block:
+
+        - name: "Up | Check whether the DataScienceCluster exists"
+          ansible.builtin.command:
+            cmd: "oc get datasciencecluster {{ dsc_name }}"
+          register: dsc_present
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: "Up | Restore DataScienceCluster"
+          ansible.builtin.command:
+            cmd: "oc apply -f {{ manifests_dir }}/03-dsc.yaml"
+          register: dsc_apply
+          changed_when: "'unchanged' not in dsc_apply.stdout"
+          when: dsc_present.rc != 0
+
+        - name: "Up | Wait for the KServe controller deployment to appear"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - deployment
+              - -n
+              - "{{ rhoai_apps_namespace }}"
+              - -o
+              - 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+          register: kserve_deploys
+          changed_when: false
+          check_mode: false
+          vars:
+            kserve_present: >-
+              {{ kserve_deploys.stdout_lines | default([])
+                 | select('search', 'kserve') | list | length > 0 }}
+          until: kserve_present | bool
+          failed_when: not (kserve_present | bool)
+          retries: "{{ (timeout_restore | int / 10) | int }}"
+          delay: 10
+          when: not ansible_check_mode
+
+        - name: "Up | Wait for KServe controllers to be Available"
+          ansible.builtin.command:
+            cmd: >-
+              oc wait --for=condition=Available deployment/{{ item }}
+              -n {{ rhoai_apps_namespace }} --timeout={{ timeout_restore }}s
+          changed_when: false
+          loop: "{{ kserve_deploys.stdout_lines | default([]) | select('search', 'kserve-controller') | list }}"
+          when: not ansible_check_mode
+
+        - name: "Up | Restore serving namespace and ServingRuntime"
+          ansible.builtin.command:
+            cmd: "oc apply -f {{ manifests_dir }}/{{ item }}"
+          register: serving_apply
+          changed_when: "'unchanged' not in serving_apply.stdout"
+          loop:
+            - 00-namespace.yaml
+            - 04-servingruntime.yaml
+
+        - name: "Up | Restore InferenceService"
+          ansible.builtin.command:
+            cmd: "oc apply -f {{ manifests_dir }}/05-inferenceservice.yaml"
+          register: isvc_apply
+          changed_when: "'unchanged' not in isvc_apply.stdout"
+
+        - name: "Up | Wait for the predictor pod to be created"
+          ansible.builtin.command:
+            cmd: >-
+              oc get pod -n {{ serving_namespace }}
+              -l serving.kserve.io/inferenceservice={{ inferenceservice_name }}
+              -o jsonpath={.items[0].metadata.name}
+          register: predictor_back
+          changed_when: false
+          check_mode: false
+          until: predictor_back.rc == 0 and (predictor_back.stdout | length > 0)
+          failed_when: not (predictor_back.rc == 0 and (predictor_back.stdout | length > 0))
+          retries: 30
+          delay: 10
+          when: not ansible_check_mode
+
+        # Much faster than a first deploy: the model image is already in the
+        # node's container storage, so this is model load, not image pull.
+        - name: "Up | Wait for the predictor to be Ready (model load, ~1-3 min)"
+          ansible.builtin.command:
+            cmd: >-
+              oc wait --for=condition=Ready pod
+              -l serving.kserve.io/inferenceservice={{ inferenceservice_name }}
+              -n {{ serving_namespace }}
+              --timeout={{ timeout_restore }}s
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: "Up | Restore OLS secret and OLSConfig"
+          ansible.builtin.command:
+            cmd: "oc apply -f {{ manifests_dir }}/{{ item }}"
+          register: ols_apply
+          changed_when: "'unchanged' not in ols_apply.stdout"
+          loop:
+            - 06-ols-secret.yaml
+            - 07-olsconfig.yaml
+
+        - name: "Up | Wait for the lightspeed-app-server pod to be created"
+          ansible.builtin.command:
+            cmd: >-
+              oc get pod -n {{ ols_namespace }}
+              -l app.kubernetes.io/component=application-server
+              -o jsonpath={.items[0].metadata.name}
+          register: ols_back
+          changed_when: false
+          check_mode: false
+          until: ols_back.rc == 0 and (ols_back.stdout | length > 0)
+          failed_when: not (ols_back.rc == 0 and (ols_back.stdout | length > 0))
+          retries: 30
+          delay: 10
+          when: not ansible_check_mode
+
+        - name: "Up | Wait for lightspeed-app-server to be Ready"
+          ansible.builtin.command:
+            cmd: >-
+              oc wait --for=condition=Ready pod
+              -l app.kubernetes.io/component=application-server
+              -n {{ ols_namespace }}
+              --timeout={{ timeout_restore }}s
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: "Up | Started"
+          ansible.builtin.debug:
+            msg:
+              - "✓ Stack restored."
+              - "  Ask a question from the console's Lightspeed panel to confirm."
+              - "  Watch vLLM:  oc -n {{ serving_namespace }} logs -f deployment/{{ inferenceservice_name }}-predictor"

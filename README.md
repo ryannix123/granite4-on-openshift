@@ -103,6 +103,10 @@ command.
 Both paths apply the same YAML files. The Ansible playbook uses `oc`
 under the hood — no extra Python dependencies, no SSH required.
 
+A third playbook, `ansible/power.yml`, stops and starts the deployed
+stack to reclaim RAM and the GPU between demos without destroying
+configuration.
+
 ## Prerequisites (do these first, in this order)
 
 1. **Install operators.** The Ansible playbook installs all four
@@ -256,6 +260,9 @@ verify only, pass `-e install_operators=false`. See
 [`ansible/README.md`](ansible/README.md) for tags, troubleshooting,
 and teardown instructions.
 
+To stop the stack between demos without tearing anything down, see
+"Powering the stack down and back up" below.
+
 ## Demo: ask OLS a question
 
 1. In the OCP web console, click the Lightspeed sparkle icon
@@ -265,6 +272,63 @@ and teardown instructions.
 3. In a side terminal:
    `oc -n llm-serving logs -f deployment/granite-41-3b-predictor`
    You'll see the request hit and tokens stream back.
+
+## Powering the stack down and back up
+
+On a single node with 8 GB of VRAM and finite RAM, you will not want
+the model resident when you are not demoing. `ansible/power.yml` stops
+and starts the stack without destroying any configuration.
+
+```bash
+cd ansible/
+
+# What's running right now, and what the node costs. Changes nothing.
+ansible-playbook -i inventory/hosts.ini power.yml
+
+# Stop OpenShift Lightspeed and model serving (default scope)
+ansible-playbook -i inventory/hosts.ini power.yml -e state=down
+
+# Stop the model only; leave OLS running
+ansible-playbook -i inventory/hosts.ini power.yml -e state=down -e scope=model
+
+# Also tear down the DataScienceCluster (KServe controllers, dashboard)
+ansible-playbook -i inventory/hosts.ini power.yml -e state=down -e scope=rhoai
+
+# Bring the whole stack back, in dependency order
+ansible-playbook -i inventory/hosts.ini power.yml -e state=up
+```
+
+`scope` is a ladder — each level includes the ones below it:
+
+| Scope | Stops | Frees |
+|---|---|---|
+| `model` | InferenceService | The GPU, plus the predictor's 12-16Gi request |
+| `ols` *(default)* | + OLSConfig | App server, Postgres, and the Solr/RHOKP retrieval pod |
+| `rhoai` | + DataScienceCluster | KServe controllers and the RHOAI dashboard |
+
+**Why it deletes custom resources instead of scaling deployments.**
+KServe and the Lightspeed operator both reconcile their workloads, so
+a hand-scaled Deployment comes straight back. Deleting the
+`InferenceService` and `OLSConfig` CRs is what actually tells the
+controllers to stand down. Nothing is lost — both are fully defined in
+`manifests/`, and `state=up` re-applies those same files.
+
+Restarting is fast because the model image stays in the node's
+container storage: `state=up` is a model load (~1-3 min), not a 3.9 GB
+image pull.
+
+**What deliberately keeps running:** the four operators, the NVIDIA
+driver daemonset, and NFD. They are small, and stopping the driver
+would mean rebuilding it on the next start.
+
+> **Note:** `scope=rhoai` removes the DataScienceCluster, which stops
+> the KServe controllers — but not the RHOAI operator itself. OLM
+> reverts manual scaling of a CSV-owned deployment, so the operator pod
+> stays. The DSC-managed workloads are where the memory actually is.
+
+Run the status mode before and after to measure the real saving on
+your node rather than trusting an estimate — it prints `oc adm top
+node` alongside a pod inventory for each namespace.
 
 ## Swapping models
 
@@ -362,6 +426,7 @@ change at all.
 │   └── 08-metrics.yaml .......... vLLM Prometheus metrics (applied manually)
 ├── ansible/
 │   ├── deploy.yml ............... Full deployment playbook (oc-based)
+│   ├── power.yml ................ Stop/start the stack to reclaim RAM + GPU
 │   ├── teardown.yml ............. Remove CRs; optionally uninstall operators
 │   ├── README.md ................ Ansible-specific docs
 │   ├── inventory/hosts.ini ...... Localhost-only inventory
