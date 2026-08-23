@@ -18,7 +18,12 @@
 
 set -euo pipefail
 
-MODEL_ID="ibm-granite/granite-4.1-3b"
+# IBM's official FP8 quantization of granite-4.1-3b (Apache 2.0).
+# Halves weight memory (~6.4 GiB -> ~3.2 GiB), which is what makes 32k
+# context fit on an 8 GB card once OLS starts injecting RAG chunks.
+# It also halves the ModelCar image size, which matters for mirroring
+# into a disconnected registry.
+MODEL_ID="ibm-granite/granite-4.1-3b-fp8"
 IMAGE_REPO="quay.io/ryan_nix/granite4-llm"
 TAG="${1:-v1}"
 
@@ -96,7 +101,7 @@ else
   MODEL_SIZE_BYTES=$(find "${MODEL_DIR}" -type f -exec stat --format=%s {} + | awk 'BEGIN{s=0} {s+=$1} END{print s}')
 fi
 
-MIN_EXPECTED_BYTES=$((3 * 1024 * 1024 * 1024))  # 3 GB floor
+MIN_EXPECTED_BYTES=$((2 * 1024 * 1024 * 1024))  # 2 GB floor (FP8 weights are ~3.2 GB)
 if [ "${MODEL_SIZE_BYTES:-0}" -lt "${MIN_EXPECTED_BYTES}" ]; then
   echo "" >&2
   echo "ERROR: Model directory is suspiciously small (< 3 GB)." >&2

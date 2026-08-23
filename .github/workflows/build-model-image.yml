@@ -36,7 +36,12 @@ on:
 
 env:
   IMAGE_REPO: quay.io/ryan_nix/granite4-llm
-  MODEL_ID: ibm-granite/granite-4.1-3b
+  # IBM's official FP8 quantization of granite-4.1-3b (Apache 2.0).
+  # Halves weight memory (~6.4 GiB -> ~3.2 GiB) so 32k context fits on an
+  # 8 GB card once OLS injects RAG chunks, and halves the image size for
+  # mirroring into a disconnected registry.
+  # NOTE: build.sh carries the same MODEL_ID. Change both together.
+  MODEL_ID: ibm-granite/granite-4.1-3b-fp8
 
 jobs:
   build-and-push:
@@ -96,9 +101,9 @@ jobs:
           ls -lh model/
           SIZE=$(du -sb model/ | awk '{print $1}')
           echo "Total size: ${SIZE} bytes"
-          MIN=$((3 * 1024 * 1024 * 1024))
+          MIN=$((2 * 1024 * 1024 * 1024))   # FP8 weights are ~3.2 GB
           if [ "${SIZE}" -lt "${MIN}" ]; then
-            echo "ERROR: Model too small (< 3 GB). Download likely failed."
+            echo "ERROR: Model too small (< 2 GB). Download likely failed."
             exit 1
           fi
           echo "✓ Size check passed."

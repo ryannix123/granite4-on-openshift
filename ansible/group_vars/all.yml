@@ -14,6 +14,78 @@ inferenceservice_name: "granite-41-3b"
 served_model_name: "granite-41-3b"
 
 # ---------------------------------------------------------------------------
+# Operator installation
+# ---------------------------------------------------------------------------
+# Set to false to go back to the original behavior: the playbook only
+# verifies the operators are present and fails with instructions if they
+# aren't. Useful when you want the OperatorHub click-through in a demo, or
+# when a customer's cluster is governed by GitOps and you're not allowed to
+# create Subscriptions from a laptop.
+#
+#   ansible-playbook -i inventory/hosts.ini deploy.yml -e install_operators=false
+#
+install_operators: true
+
+# How long to wait (seconds) for a single operator to go from Subscription
+# to a Succeeded CSV. RHOAI is the slowest of the four.
+operator_install_timeout: 600
+
+# The four operators this reference architecture depends on, in dependency
+# order. NFD must label the node before the GPU Operator will do anything,
+# and RHOAI's KServe must exist before the InferenceService is applied.
+#
+# Per-entry keys:
+#   name                  human-readable label used in task output
+#   package               OLM package name (the packagemanifest name)
+#   namespace             namespace to install into
+#   crd                   the CRD that proves this operator is installed
+#   catalog_source        catalog to fall back to if discovery fails
+#   fallback_channel      channel to use if the catalog has no defaultChannel
+#   channel               OPTIONAL — pin a channel; overrides discovery
+#   starting_csv          OPTIONAL — pin an exact version
+#   all_namespaces        OPTIONAL — true for AllNamespaces install mode
+#   install_plan_approval OPTIONAL — Automatic (default) or Manual
+#   namespace_labels      OPTIONAL — labels to stamp on the namespace
+#   csv_prefix            OPTIONAL — defaults to "<package>."
+#
+# By default the channel is discovered from the cluster's own catalog
+# (.status.defaultChannel), so this list does not rot every time Red Hat
+# or NVIDIA ships a new stream.
+required_operators:
+
+  - name: "Node Feature Discovery Operator"
+    package: "nfd"
+    namespace: "openshift-nfd"
+    crd: "nodefeaturediscoveries.nfd.openshift.io"
+    catalog_source: "redhat-operators"
+    fallback_channel: "stable"
+
+  - name: "NVIDIA GPU Operator"
+    package: "gpu-operator-certified"
+    namespace: "nvidia-gpu-operator"
+    crd: "clusterpolicies.nvidia.com"
+    catalog_source: "certified-operators"
+    fallback_channel: "stable"
+    namespace_labels:
+      openshift.io/cluster-monitoring: "true"
+
+  - name: "Red Hat OpenShift AI"
+    package: "rhods-operator"
+    namespace: "redhat-ods-operator"
+    crd: "datascienceclusters.datasciencecluster.opendatahub.io"
+    catalog_source: "redhat-operators"
+    fallback_channel: "stable"
+    # RHOAI installs cluster-wide: OperatorGroup with an empty spec.
+    all_namespaces: true
+
+  - name: "OpenShift Lightspeed Operator"
+    package: "lightspeed-operator"
+    namespace: "openshift-lightspeed"
+    crd: "olsconfigs.ols.openshift.io"
+    catalog_source: "redhat-operators"
+    fallback_channel: "stable"
+
+# ---------------------------------------------------------------------------
 # NVIDIA PCI vendor ID (always 10de for NVIDIA GPUs)
 # ---------------------------------------------------------------------------
 nvidia_pci_vendor_id: "10de"

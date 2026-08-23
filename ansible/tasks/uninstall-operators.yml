@@ -1,0 +1,55 @@
+---
+# tasks/uninstall-operators.yml
+#
+# Removes ONE operator: Subscription, CSV, OperatorGroup, namespace.
+# Included in a loop from teardown.yml when uninstall_operators=true.
+# Deliberately does NOT touch CRDs -- deleting a CRD deletes every CR of
+# that type cluster-wide, which is too blunt to do implicitly.
+#
+# Contract:
+#   in  -> op  (a dict from required_operators)
+
+- name: "Uninstall | Find the CSV | {{ op.name }}"
+  ansible.builtin.command:
+    argv:
+      - oc
+      - get
+      - csv
+      - -n
+      - "{{ op.namespace }}"
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+  register: csv_list
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Uninstall | Remove the Subscription | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: >-
+      oc delete subscription {{ op.package }}
+      -n {{ op.namespace }} --ignore-not-found
+  register: sub_del
+  changed_when: "'deleted' in sub_del.stdout"
+
+- name: "Uninstall | Remove the CSV | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: "oc delete csv {{ item }} -n {{ op.namespace }} --ignore-not-found"
+  register: csv_del
+  changed_when: "'deleted' in csv_del.stdout"
+  loop: "{{ csv_list.stdout_lines | default([]) | select('match', '^' ~ (op.csv_prefix | default(op.package ~ '.'))) | list }}"
+
+- name: "Uninstall | Remove the OperatorGroup | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: >-
+      oc delete operatorgroup
+      {{ op.operator_group_name | default(op.namespace ~ '-og') }}
+      -n {{ op.namespace }} --ignore-not-found
+  register: og_del
+  changed_when: "'deleted' in og_del.stdout"
+
+- name: "Uninstall | Remove the namespace | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: "oc delete namespace {{ op.namespace }} --ignore-not-found --wait=false"
+  register: ns_del
+  changed_when: "'deleted' in ns_del.stdout"

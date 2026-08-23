@@ -1,0 +1,50 @@
+---
+# Rendered by tasks/install-operators.yml — do not edit by hand.
+# Operator: {{ op.name }}
+# Package:  {{ op.package }}
+# Channel:  {{ resolved_channel }}  (source: {{ channel_origin }})
+# Catalog:  {{ resolved_catalog }}/{{ resolved_catalog_ns }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ op.namespace }}
+{% if op.namespace_labels is defined %}
+  labels:
+{% for key, value in op.namespace_labels.items() %}
+    {{ key }}: "{{ value }}"
+{% endfor %}
+{% endif %}
+{% if needs_operator_group %}
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: {{ op.operator_group_name | default(op.namespace + '-og') }}
+  namespace: {{ op.namespace }}
+{% if op.all_namespaces | default(false) %}
+spec: {}
+{% else %}
+spec:
+  targetNamespaces:
+    - {{ op.namespace }}
+{% endif %}
+{% endif %}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: {{ op.package }}
+  namespace: {{ op.namespace }}
+spec:
+  name: {{ op.package }}
+  channel: {{ resolved_channel }}
+  source: {{ resolved_catalog }}
+  sourceNamespace: {{ resolved_catalog_ns }}
+  installPlanApproval: {{ op.install_plan_approval | default('Automatic') }}
+{% if op.starting_csv is defined %}
+  startingCSV: {{ op.starting_csv }}
+{% endif %}
+{% if op.config is defined %}
+  config:
+{{ op.config | to_nice_yaml(indent=2) | indent(4, true) }}
+{% endif %}

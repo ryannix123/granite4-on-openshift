@@ -1,0 +1,234 @@
+---
+# test-tool-calling.yml — Evaluate Granite 4.1 tool calling via OLS introspection.
+#
+# This experiment was prompted by feedback from the OLS development team:
+# Granite models reportedly struggle with tool calling (their granite-4-h-small
+# tests pass ~50% of the time). This playbook tests granite-4.1-3b (dense)
+# against questions that REQUIRE live cluster data, forcing tool calls
+# through the openshift-mcp-server sidecar.
+#
+# IMPORTANT: This playbook temporarily enables introspectionEnabled: true,
+# which injects MCP tool definitions into every prompt (~several thousand
+# tokens). On 8 GB VRAM with max-model-len=9216, this may exceed the
+# context window — which is itself a finding worth reporting.
+#
+# Usage:
+#   ansible-playbook -i inventory/hosts.ini tests/test-tool-calling.yml
+#
+# To restore the non-tool-calling config afterward:
+#   ansible-playbook -i inventory/hosts.ini tests/test-tool-calling.yml -e restore=true
+
+- name: "Test Granite 4.1 tool calling via OLS introspection"
+  hosts: local
+  gather_facts: false
+
+  vars:
+    questions_file: "{{ playbook_dir }}/test-tool-calling-questions.yml"
+    report_file: "/tmp/ols-tool-calling-report.json"
+    ols_namespace: "openshift-lightspeed"
+    query_timeout: 240
+    restore: false
+
+  tasks:
+
+    # ------------------------------------------------------------------
+    # Restore mode: turn introspection back off and exit
+    # ------------------------------------------------------------------
+
+    - name: "Restore | Disable introspection"
+      when: restore | bool
+      block:
+        - name: "Restore | Set introspectionEnabled false"
+          ansible.builtin.command:
+            cmd: >
+              oc patch olsconfig cluster --type=merge
+              -p={{ '{"spec":{"ols":{"introspectionEnabled": false}}}' | quote }}
+          changed_when: true
+
+        - name: "Restore | Done"
+          ansible.builtin.debug:
+            msg: "Introspection disabled. OLS will restart with the RAG-only config."
+
+        - name: "Restore | End play"
+          ansible.builtin.meta: end_play
+
+    # ------------------------------------------------------------------
+    # Preflight
+    # ------------------------------------------------------------------
+
+    - name: "Preflight | Verify logged in"
+      ansible.builtin.command:
+        cmd: oc whoami
+      register: oc_user
+      changed_when: false
+      failed_when: oc_user.rc != 0
+
+    - name: "Preflight | Get bearer token"
+      ansible.builtin.command:
+        cmd: oc whoami -t
+      register: oc_token
+      changed_when: false
+
+    - name: "Preflight | Load tool-calling questions"
+      ansible.builtin.include_vars:
+        file: "{{ questions_file }}"
+        name: test_data
+
+    - name: "Preflight | Warn about context window"
+      ansible.builtin.debug:
+        msg:
+          - "⚠ Enabling introspection injects MCP tool definitions into every prompt."
+          - "  On 8 GB VRAM with max-model-len=9216, this may exceed the context window."
+          - "  If all questions fail with token-limit errors, that is the finding:"
+          - "  8 GB VRAM is insufficient for OLS tool calling with the full MCP toolset."
+
+    # ------------------------------------------------------------------
+    # Enable introspection (tool calling)
+    # ------------------------------------------------------------------
+
+    - name: "Setup | Enable introspectionEnabled true"
+      ansible.builtin.command:
+        cmd: >
+          oc patch olsconfig cluster --type=merge
+          -p={{ '{"spec":{"ols":{"introspectionEnabled": true}}}' | quote }}
+      changed_when: true
+
+    - name: "Setup | Wait for OLS app server to restart and become Ready"
+      ansible.builtin.command:
+        cmd: >
+          oc rollout status deployment/lightspeed-app-server
+          -n {{ ols_namespace }} --timeout=300s
+      changed_when: false
+      failed_when: false
+
+    - name: "Setup | Extra settle time for MCP sidecar"
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: "Setup | Get OLS pod name"
+      ansible.builtin.command:
+        cmd: >
+          oc get pod -n {{ ols_namespace }}
+          -l app.kubernetes.io/component=application-server
+          -o jsonpath={.items[0].metadata.name}
+      register: ols_pod
+      changed_when: false
+
+    - name: "Setup | Confirm MCP sidecar is present"
+      ansible.builtin.command:
+        cmd: >
+          oc get pod -n {{ ols_namespace }} {{ ols_pod.stdout }}
+          -o jsonpath={.spec.containers[*].name}
+      register: containers
+      changed_when: false
+
+    - name: "Setup | Display containers in OLS pod"
+      ansible.builtin.debug:
+        msg: "OLS pod containers: {{ containers.stdout }}"
+
+    # ------------------------------------------------------------------
+    # Run tool-calling questions
+    # ------------------------------------------------------------------
+
+    - name: "Test | Send tool-calling questions to OLS"
+      ansible.builtin.shell:
+        cmd: |
+          oc exec -n {{ ols_namespace }} {{ ols_pod.stdout }} -c lightspeed-service-api -- \
+            curl -sS -m {{ query_timeout }} -k \
+            -X POST https://localhost:8443/v1/query \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer {{ oc_token.stdout }}' \
+            -d '{"query": "{{ item.question | regex_replace("\"", "\\\"") }}", "conversation_id": ""}'
+      register: ols_responses
+      changed_when: false
+      failed_when: false
+      loop: "{{ test_data.questions }}"
+      loop_control:
+        label: "[{{ item.category }}] {{ item.question | truncate(55) }}"
+
+    # ------------------------------------------------------------------
+    # Score: did the model return real cluster data?
+    # ------------------------------------------------------------------
+
+    - name: "Score | Evaluate each tool-calling response"
+      ansible.builtin.set_fact:
+        tc_results: "{{ tc_results | default([]) + [result] }}"
+      vars:
+        raw: "{{ item.stdout if item.stdout else '' }}"
+        is_json: "{{ (raw | trim).startswith('{') }}"
+        response_body: "{{ (raw | from_json).response | default('') if is_json else raw }}"
+        token_limit_error: "{{ 'context' in raw and 'token' in raw }}"
+        kw_hits: >-
+          {% set hits = [] %}
+          {% for kw in test_data.questions[idx].expected_keywords %}
+          {%   if kw | lower in response_body | lower %}{% set _ = hits.append(kw) %}{% endif %}
+          {% endfor %}
+          {{ hits }}
+        kw_hit_count: "{{ kw_hits | from_yaml | length }}"
+        passed: "{{ (kw_hit_count | int) >= (test_data.questions[idx].min_keyword_hits | int) and not token_limit_error }}"
+        result:
+          question: "{{ test_data.questions[idx].question }}"
+          difficulty: "{{ test_data.questions[idx].difficulty }}"
+          passed: "{{ passed }}"
+          token_limit_error: "{{ token_limit_error }}"
+          keyword_hits: "{{ kw_hit_count }}"
+          keyword_target: "{{ test_data.questions[idx].min_keyword_hits }}"
+          keywords_found: "{{ kw_hits | from_yaml }}"
+          response_preview: "{{ response_body | truncate(250) }}"
+      loop: "{{ ols_responses.results }}"
+      loop_control:
+        index_var: idx
+        label: "Scoring Q{{ idx + 1 }}"
+
+    # ------------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------------
+
+    - name: "Report | Summary stats"
+      ansible.builtin.set_fact:
+        tc_total: "{{ tc_results | length }}"
+        tc_passed: "{{ tc_results | selectattr('passed', 'equalto', true) | list | length }}"
+        tc_token_errors: "{{ tc_results | selectattr('token_limit_error', 'equalto', true) | list | length }}"
+
+    - name: "Report | Per-question results"
+      ansible.builtin.debug:
+        msg: >-
+          {{ '✓' if item.passed else '✗' }}
+          [{{ item.difficulty }}]
+          {{ item.question | truncate(50) }}
+          — {{ 'TOKEN LIMIT' if item.token_limit_error else (item.keyword_hits ~ '/' ~ item.keyword_target ~ ' keywords') }}
+      loop: "{{ tc_results }}"
+      loop_control:
+        index_var: ridx
+        label: "Q{{ ridx + 1 }}"
+
+    - name: "Report | Summary"
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════════════════════════"
+          - "Granite 4.1 3B Tool-Calling Report — {{ tc_passed }}/{{ tc_total }} passed"
+          - "════════════════════════════════════════════════════════════"
+          - "Model:               granite-4.1-3b (dense, self-hosted vLLM)"
+          - "Hardware:            RTX 3060 Ti, 8 GB VRAM"
+          - "max-model-len:       9216"
+          - "Token-limit errors:  {{ tc_token_errors }}/{{ tc_total }}"
+          - "Date:                {{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+          - "════════════════════════════════════════════════════════════"
+          - "{% if (tc_token_errors | int) > 0 %}NOTE: {{ tc_token_errors }} questions hit the context-window limit.{% endif %}"
+          - "{% if (tc_token_errors | int) > 0 %}This indicates 8 GB VRAM may be insufficient for OLS tool{% endif %}"
+          - "{% if (tc_token_errors | int) > 0 %}calling with the full MCP toolset, independent of model quality.{% endif %}"
+          - "════════════════════════════════════════════════════════════"
+
+    - name: "Report | Write JSON report"
+      ansible.builtin.copy:
+        content: "{{ {'summary': {'total': tc_total | int, 'passed': tc_passed | int, 'token_limit_errors': tc_token_errors | int, 'model': 'granite-4.1-3b', 'hardware': 'RTX 3060 Ti 8GB', 'max_model_len': 9216, 'timestamp': lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ')}, 'results': tc_results} | to_nice_json }}"
+        dest: "{{ report_file }}"
+      changed_when: true
+
+    - name: "Report | Reminder to restore"
+      ansible.builtin.debug:
+        msg:
+          - "Detailed report: {{ report_file }}"
+          - ""
+          - "Introspection is STILL ENABLED. To restore RAG-only mode:"
+          - "  ansible-playbook -i inventory/hosts.ini tests/test-tool-calling.yml -e restore=true"

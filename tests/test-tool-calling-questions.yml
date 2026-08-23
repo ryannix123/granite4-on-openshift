@@ -1,0 +1,127 @@
+---
+# test-tool-calling-questions.yml — Questions that REQUIRE live cluster data.
+#
+# Unlike test-questions.yml (which tests RAG-based knowledge), these
+# questions can ONLY be answered correctly by calling the cluster API
+# through the openshift-mcp-server sidecar. This exercises Granite 4.1's
+# tool-calling capability — the area the OLS team reports Granite
+# struggling with.
+#
+# A correct answer requires the model to:
+#   1. Recognize the question needs live data
+#   2. Select the right MCP tool
+#   3. Format the tool call correctly
+#   4. Incorporate the tool result into its answer
+#
+# Scoring looks for evidence of actual cluster data in the response,
+# not just plausible-sounding text. A model that hallucinates an answer
+# without calling the tool will fail because the specifics won't match.
+
+questions:
+
+  - question: "How many nodes are in my cluster right now?"
+    category: tool_calling
+    difficulty: easy
+    # SNO has exactly 1 node. A correct tool call returns "1".
+    # A hallucinated answer often guesses 3 (typical cluster).
+    expected_keywords:
+      - "1"
+      - node
+    min_keyword_hits: 1
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 20
+    max_response_length: 3000
+
+  - question: "List the pods currently running in the openshift-lightspeed namespace."
+    category: tool_calling
+    difficulty: medium
+    # Correct answer mentions actual pods: lightspeed-app-server,
+    # lightspeed-console-plugin, lightspeed-postgres-server, operator
+    expected_keywords:
+      - lightspeed-app-server
+      - postgres
+      - console-plugin
+    min_keyword_hits: 2
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 40
+    max_response_length: 3000
+
+  - question: "What is the current status of the granite-41-3b deployment in the llm-serving namespace?"
+    category: tool_calling
+    difficulty: medium
+    expected_keywords:
+      - granite-41-3b
+      - running
+      - ready
+      - available
+    min_keyword_hits: 2
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 40
+    max_response_length: 3000
+
+  - question: "What version of OpenShift is my cluster running?"
+    category: tool_calling
+    difficulty: easy
+    # Correct tool call returns the actual ClusterVersion (e.g. 4.21.x)
+    expected_keywords:
+      - "4.2"
+      - version
+    min_keyword_hits: 1
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 20
+    max_response_length: 3000
+
+  - question: "How many namespaces currently exist in my cluster?"
+    category: tool_calling
+    difficulty: medium
+    # The model must call a tool and count — any specific number that
+    # isn't obviously hallucinated indicates a successful tool call.
+    expected_keywords:
+      - namespace
+    min_keyword_hits: 1
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 20
+    max_response_length: 3000
+
+  - question: "Are there any pods in CrashLoopBackOff state in my cluster?"
+    category: tool_calling
+    difficulty: hard
+    # nfd-gc has been crashlooping. A correct tool call would find it
+    # (unless scaled to 0). Tests whether the model queries pod status.
+    expected_keywords:
+      - pod
+      - "crashloop"
+    min_keyword_hits: 1
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 30
+    max_response_length: 3000
+
+  - question: "What storage classes are available in my cluster?"
+    category: tool_calling
+    difficulty: medium
+    expected_keywords:
+      - storage
+      - class
+    min_keyword_hits: 1
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 30
+    max_response_length: 3000
+
+  - question: "Show me the most recent events in the llm-serving namespace."
+    category: tool_calling
+    difficulty: hard
+    expected_keywords:
+      - event
+      - llm-serving
+    min_keyword_hits: 1
+    anti_keywords: []
+    requires_tool_call: true
+    min_response_length: 30
+    max_response_length: 3000

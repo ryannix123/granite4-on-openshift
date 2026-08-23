@@ -1,5 +1,5 @@
 ---
-# InferenceService for Gemma 4 E4B on the 3060 Ti.
+# InferenceService for IBM Granite 4.1 3B on the 3060 Ti.
 #
 # storageUri uses the OCI scheme, which makes KServe pull the model
 # from a container image (the "ModelCar" pattern). We build this image
@@ -30,12 +30,19 @@ metadata:
     opendatahub.io/dashboard: "true"
 spec:
   predictor:
+    # A surge rolling update is structurally impossible here: the new pod
+    # needs nvidia.com/gpu: 1 while the old pod still holds the only GPU,
+    # so it stays Pending forever and the rollout deadlocks. Recreate tears
+    # the old pod down first. On a multi-GPU pilot cluster, drop this and
+    # take the default rolling update instead.
+    deploymentStrategy:
+      type: Recreate
     minReplicas: 1
     maxReplicas: 1
     model:
       modelFormat:
         name: vLLM
-      runtime: vllm-gemma4
+      runtime: vllm-granite
       # OCI image built from ./Containerfile, pushed to your Quay.
       # Update the tag as you iterate.
       storageUri: oci://quay.io/ryan_nix/granite4-llm:v1

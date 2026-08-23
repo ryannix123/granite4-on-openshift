@@ -1,6 +1,6 @@
 ---
 # OLSConfig pointing OpenShift Lightspeed at the in-cluster KServe
-# predictor service for Gemma 4.
+# predictor service for Granite 4.1.
 #
 # The URL pattern for KServe RawDeployment is:
 #   http://<isvc-name>-predictor.<namespace>.svc.cluster.local:80/v1
@@ -19,7 +19,8 @@
 #   `openai` provider type pointing at a self-hosted vLLM is the
 #   "technically works" path, not the "supported" path.
 # - For an enterprise pilot, file a support exception or wait for
-#   official Vertex/Gemma-flavored support if/when it arrives.
+#   official support for self-hosted vLLM providers if/when it
+#   arrives.
 apiVersion: ols.openshift.io/v1alpha1
 kind: OLSConfig
 metadata:
@@ -27,17 +28,17 @@ metadata:
 spec:
   llm:
     providers:
-      - name: gemma-rhoai
+      - name: granite-rhoai
         type: openai
         url: 'http://granite-41-3b-predictor.llm-serving.svc.cluster.local:8080/v1'
         credentialsSecretRef:
-          name: gemma-creds
+          name: granite-creds
         models:
           - name: granite-41-3b
-            contextWindowSize: 9216
+            contextWindowSize: 32768
   ols:
     defaultModel: granite-41-3b
-    defaultProvider: gemma-rhoai
+    defaultProvider: granite-rhoai
     introspectionEnabled: false
     logLevel: INFO
     deployment:

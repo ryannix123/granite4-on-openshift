@@ -1,12 +1,14 @@
 ---
 # teardown.yml - Remove everything deploy.yml created.
 #
-# NOTE: This does NOT uninstall the operators themselves (NFD, GPU
-# Operator, RHOAI, OLS). Those were installed manually from OperatorHub
-# and should be uninstalled manually if you want them gone.
+# By default this removes only the custom resources and leaves the four
+# operators installed, which is what you want between demo runs.
 #
 # Usage:
 #   ansible-playbook -i inventory/hosts.ini teardown.yml
+#
+# To also uninstall the operators (Subscriptions, CSVs, namespaces):
+#   ansible-playbook -i inventory/hosts.ini teardown.yml -e uninstall_operators=true
 #
 # To see what would happen first:
 #   ansible-playbook -i inventory/hosts.ini teardown.yml --check
@@ -15,6 +17,9 @@
   hosts: local
   gather_facts: false
 
+  vars:
+    uninstall_operators: false
+
   tasks:
     - name: "Preflight | Verify logged in"
       ansible.builtin.command:
@@ -22,18 +27,26 @@
       register: oc_whoami
       changed_when: false
       failed_when: oc_whoami.rc != 0
+      check_mode: false
 
     - name: "Confirm teardown"
       ansible.builtin.pause:
         prompt: |
           This will remove:
-            - OLSConfig and OLS credentials secret
+            - OLSConfig and OLS credentials secret (granite-creds)
             - InferenceService, ServingRuntime, llm-serving namespace
             - RHOAI DataScienceCluster
             - NVIDIA GPU ClusterPolicy (uninstalls driver from the node)
             - NodeFeatureDiscovery CR
+          {% if uninstall_operators | bool %}
+            - AND the four operators themselves, plus their namespaces:
+          {% for op in required_operators %}
+                {{ op.name }} ({{ op.namespace }})
+          {% endfor %}
+          {% else %}
 
           The operators themselves will NOT be removed.
+          {% endif %}
 
           Press Enter to continue or Ctrl+C to abort.
       when: not ansible_check_mode
@@ -50,7 +63,7 @@
 
     - name: "Remove OLS credentials secret"
       ansible.builtin.command:
-        cmd: oc delete secret gemma-creds -n openshift-lightspeed --ignore-not-found
+        cmd: oc delete secret granite-creds -n openshift-lightspeed --ignore-not-found
       register: out
       changed_when: "'deleted' in out.stdout"
 
@@ -90,9 +103,43 @@
       register: out
       changed_when: "'deleted' in out.stdout"
 
+
+    ############################################################################
+    # OPTIONAL: uninstall the operators themselves.
+    #
+    # Runs in reverse dependency order. The CRs above must be gone first --
+    # deleting the GPU Operator while a ClusterPolicy still exists leaves the
+    # namespace stuck Terminating on a finalizer.
+    ############################################################################
+
+    - name: "Uninstall the operators themselves"
+      ansible.builtin.include_tasks: tasks/uninstall-operators.yml
+      when: uninstall_operators | bool
+      loop: "{{ required_operators | reverse | list }}"
+      loop_control:
+        loop_var: op
+        label: "{{ op.name }}"
+
+    - name: "Uninstall | Note about leftover CRDs"
+      ansible.builtin.debug:
+        msg:
+          - "Operator Subscriptions, CSVs and namespaces removed."
+          - "OLM does NOT garbage-collect CRDs. If you want a truly clean"
+          - "cluster, delete them by hand:"
+          - "  oc delete crd {{ required_operators | map(attribute='crd') | join(' ') }}"
+          - "Watch for namespaces stuck Terminating on a finalizer:"
+          - "  oc get ns | grep Terminating"
+      when: uninstall_operators | bool
+
     - name: "Teardown summary"
       ansible.builtin.debug:
         msg:
           - "Custom resources removed."
-          - "Operators themselves were NOT uninstalled."
-          - "Uninstall via OperatorHub > Installed Operators if desired."
+          - >-
+            {{ 'Operators were also uninstalled.'
+               if uninstall_operators | bool
+               else 'Operators themselves were NOT uninstalled.' }}
+          - >-
+            {{ 'Re-run deploy.yml to reinstall everything from scratch.'
+               if uninstall_operators | bool
+               else 'Uninstall via OperatorHub > Installed Operators if desired.' }}

@@ -39,7 +39,11 @@ spec:
         - "--gpu-memory-utilization=0.95"
         - "--enforce-eager"
         - "--enable-auto-tool-choice"
-        - "--tool-call-parser=granite"
+        # Granite 4.1 emits Hermes-style <tool_call>{...}</tool_call> tags --
+        # confirmed in the model's own chat_template.jinja. The `granite`
+        # parser targets Granite 3.x's <|tool_call|> array format and will
+        # silently pass tool calls through to the user as plain text.
+        - "--tool-call-parser=hermes"
       env:
         - name: HF_HUB_OFFLINE
           value: "1"

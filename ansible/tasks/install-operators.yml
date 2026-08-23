@@ -1,0 +1,284 @@
+---
+# tasks/install-operators.yml
+#
+# Installs ONE operator via OLM (Namespace + OperatorGroup + Subscription),
+# then blocks until the CSV reports Succeeded and the operator's CRD is
+# established. Included in a loop from deploy.yml with `op` set to one
+# entry from `required_operators`.
+#
+# Still `oc`-only: no kubernetes.core collection, no Python K8s libs.
+#
+# Contract:
+#   in  -> op  (a dict from required_operators)
+#   out -> nothing; fails loudly if the operator never reaches Succeeded
+
+- name: "Operators | Look up the package in OperatorHub | {{ op.name }}"
+  ansible.builtin.command:
+    argv:
+      - oc
+      - get
+      - packagemanifest
+      - "{{ op.package }}"
+      - -n
+      - openshift-marketplace
+      - -o
+      - 'jsonpath={.status.defaultChannel}|{.status.catalogSource}|{.status.catalogSourceNamespace}'
+  register: pkg_manifest
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Operators | Fail if the package is not in any catalog | {{ op.name }}"
+  ansible.builtin.fail:
+    msg: |
+      Package "{{ op.package }}" was not found in any CatalogSource on this
+      cluster, so it cannot be installed automatically.
+
+      Most likely causes:
+        - The cluster is disconnected / using a mirrored catalog that does
+          not carry this package.
+        - The "{{ op.catalog_source }}" CatalogSource is disabled or still
+          starting. Check with:
+              oc get catalogsource -n openshift-marketplace
+              oc get pods -n openshift-marketplace
+        - Marketplace is disabled entirely (OperatorHub CR has all sources
+          disabled): oc get operatorhub cluster -o yaml
+
+      Install "{{ op.name }}" manually from OperatorHub, or set
+      install_operators: false in group_vars/all.yml and pre-install the
+      four operators yourself.
+  when: pkg_manifest.rc != 0
+
+- name: "Operators | Split the packagemanifest lookup | {{ op.name }}"
+  ansible.builtin.set_fact:
+    # Pad with '||' so the list always has 3 elements even when the
+    # jsonpath returns nothing. Avoids an IndexError on a sparse status.
+    pm_parts: "{{ ((pkg_manifest.stdout | default('') | trim) ~ '||').split('|') }}"
+
+- name: "Operators | Resolve channel and catalog | {{ op.name }}"
+  ansible.builtin.set_fact:
+    # Precedence: pinned in group_vars > catalog's defaultChannel > fallback
+    resolved_channel: >-
+      {{ op.channel | default(pm_parts[0], true)
+         | default(op.fallback_channel | default(''), true) }}
+    resolved_catalog: >-
+      {{ pm_parts[1] | default(op.catalog_source, true) }}
+    resolved_catalog_ns: >-
+      {{ pm_parts[2] | default('openshift-marketplace', true) }}
+    channel_origin: >-
+      {{ 'pinned in group_vars' if op.channel is defined
+         else ('catalog defaultChannel' if pm_parts[0] | length > 0
+               else 'hardcoded fallback') }}
+
+- name: "Operators | Fail if no channel could be resolved | {{ op.name }}"
+  ansible.builtin.fail:
+    msg: |
+      Could not determine a subscription channel for "{{ op.package }}".
+      The catalog did not advertise a defaultChannel and no channel is
+      pinned in group_vars/all.yml.
+
+      List the available channels and pin one:
+        oc get packagemanifest {{ op.package }} -n openshift-marketplace \
+          -o jsonpath='{range .status.channels[*]}{.name}{"\n"}{end}'
+  when: resolved_channel | length == 0
+
+- name: "Operators | Check for a pre-existing OperatorGroup | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: "oc get operatorgroup -n {{ op.namespace }} -o name"
+  register: existing_og
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Operators | Decide whether we need to create an OperatorGroup | {{ op.name }}"
+  ansible.builtin.set_fact:
+    # A namespace may only have ONE OperatorGroup. If something already put
+    # one there (a partial install, another operator sharing the namespace),
+    # reuse it rather than creating a second one and wedging OLM.
+    needs_operator_group: >-
+      {{ (op.create_operator_group | default(true))
+         and (existing_og.stdout | default('') | trim | length == 0) }}
+
+- name: "Operators | Reusing existing OperatorGroup | {{ op.name }}"
+  ansible.builtin.debug:
+    msg: >-
+      Namespace {{ op.namespace }} already has an OperatorGroup
+      ({{ existing_og.stdout_lines | join(', ') }}); reusing it.
+  when: not needs_operator_group
+
+- name: "Operators | Render subscription manifest | {{ op.name }}"
+  ansible.builtin.template:
+    src: operator-subscription.yaml.j2
+    dest: "{{ operator_render_dir.path }}/{{ op.package }}-subscription.yaml"
+    mode: "0600"
+  changed_when: false
+
+- name: "Operators | Subscribe | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: >-
+      oc apply -f {{ operator_render_dir.path }}/{{ op.package }}-subscription.yaml
+      {{ '--dry-run=server' if ansible_check_mode else '' }}
+  register: sub_apply
+  changed_when: "'unchanged' not in sub_apply.stdout"
+  check_mode: false
+
+- name: "Operators | Resolve the Subscription into an InstallPlan | {{ op.name }}"
+  when: not ansible_check_mode
+  block:
+
+    # Poll installPlanRef AND the ResolutionFailed condition in one call, so a
+    # dependency conflict breaks the loop in ~10s instead of spinning for the
+    # full operator_install_timeout and then reporting an empty string.
+    - name: "Operators | Wait for OLM to resolve the Subscription | {{ op.name }}"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - subscription
+          - "{{ op.package }}"
+          - -n
+          - "{{ op.namespace }}"
+          - -o
+          - 'jsonpath={.status.installPlanRef.name}|{range .status.conditions[?(@.type=="ResolutionFailed")]}{.status}:{.message}{end}'
+      register: sub_status
+      changed_when: false
+      check_mode: false
+      # failed_when mirrors until: a spent until-loop otherwise reports "ok"
+      # and we would sail past a Subscription that never resolved.
+      until: sub_resolved | bool
+      failed_when: not (sub_resolved | bool)
+      retries: "{{ (operator_install_timeout | int / 10) | int }}"
+      delay: 10
+      vars:
+        sub_parts: "{{ ((sub_status.stdout | default('') | trim) ~ '||').split('|') }}"
+        sub_resolved: >-
+          {{ (sub_parts[0] | length > 0) or (sub_parts[1] is match('True:')) }}
+
+    - name: "Operators | Read the resolution result | {{ op.name }}"
+      ansible.builtin.set_fact:
+        install_plan_name: "{{ ((sub_status.stdout | default('') | trim) ~ '||').split('|')[0] }}"
+        resolution_failure: "{{ ((sub_status.stdout | default('') | trim) ~ '||').split('|')[1] }}"
+
+    - name: "Operators | Fail fast on an OLM resolution error | {{ op.name }}"
+      ansible.builtin.fail:
+        msg: |
+          OLM refused to resolve the Subscription for "{{ op.package }}"
+          in namespace {{ op.namespace }} (channel {{ resolved_channel }},
+          catalog {{ resolved_catalog }}).
+
+          OLM said:
+            {{ resolution_failure | regex_replace('^True:', '') | trim }}
+
+          Common causes:
+            - The channel does not exist in this cluster's catalog. List
+              what's actually on offer and pin one in group_vars/all.yml:
+                oc get packagemanifest {{ op.package }} \
+                  -n openshift-marketplace \
+                  -o jsonpath='{range .status.channels[*]}{.name}{"\n"}{end}'
+            - An operator already installed in {{ op.namespace }} provides
+              the same API, so OLM won't install a second one.
+            - A required dependency isn't available in any enabled catalog.
+      when: resolution_failure is match('True:')
+
+  rescue:
+
+    - name: "Operators | Dump the Subscription status | {{ op.name }}"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - subscription
+          - "{{ op.package }}"
+          - -n
+          - "{{ op.namespace }}"
+          - -o
+          - 'jsonpath={range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}'
+      register: sub_conditions
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: "Operators | Report why the Subscription never resolved | {{ op.name }}"
+      ansible.builtin.fail:
+        msg: |
+          {{ ansible_failed_result.msg | default('OLM never produced an InstallPlan for "' ~ op.package ~ '".') }}
+
+          Subscription conditions in {{ op.namespace }}:
+          {% for line in sub_conditions.stdout_lines | default(['(none reported)'], true) %}
+            {{ line }}
+          {% endfor %}
+
+          Dig further with:
+            oc describe sub {{ op.package }} -n {{ op.namespace }}
+            oc get ip -n {{ op.namespace }}
+            oc -n openshift-operator-lifecycle-manager logs \
+              -l app=catalog-operator --tail=50
+
+- name: "Operators | Approve the InstallPlan (manual approval mode only) | {{ op.name }}"
+  ansible.builtin.shell:
+    cmd: |
+      oc patch installplan {{ install_plan_name }} -n {{ op.namespace }} \
+        --type merge -p '{"spec":{"approved":true}}'
+  register: ip_patch
+  changed_when: "'patched' in ip_patch.stdout"
+  when:
+    - not ansible_check_mode
+    - (op.install_plan_approval | default('Automatic')) == 'Manual'
+
+- name: "Operators | Wait for the CSV to reach Succeeded | {{ op.name }}"
+  ansible.builtin.command:
+    argv:
+      - oc
+      - get
+      - csv
+      - -n
+      - "{{ op.namespace }}"
+      - -o
+      - 'jsonpath={range .items[*]}{.metadata.name}|{.status.phase}{"\n"}{end}'
+  register: csv_status
+  changed_when: false
+  check_mode: false
+  vars:
+    csv_succeeded: >-
+      {{ csv_status.stdout_lines | default([])
+         | select('match', '^' ~ (op.csv_prefix | default(op.package ~ '.')) ~ '.*\|Succeeded$')
+         | list | length > 0 }}
+  until: csv_succeeded | bool
+  failed_when: not (csv_succeeded | bool)
+  retries: "{{ (operator_install_timeout | int / 15) | int }}"
+  delay: 15
+  when: not ansible_check_mode
+
+- name: "Operators | Wait for the CRD to be established | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: "oc get crd {{ op.crd }}"
+  register: crd_ready
+  changed_when: false
+  check_mode: false
+  until: crd_ready.rc == 0
+  failed_when: crd_ready.rc != 0
+  retries: 20
+  delay: 5
+  when: not ansible_check_mode
+
+- name: "Operators | Confirm CRD is Established | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: "oc wait --for=condition=Established crd/{{ op.crd }} --timeout=120s"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: "Operators | Wait for the operator deployment to be Available | {{ op.name }}"
+  ansible.builtin.command:
+    cmd: >-
+      oc wait --for=condition=Available deployment
+      --all -n {{ op.namespace }} --timeout={{ timeout_operator_ready }}s
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: "Operators | Installed | {{ op.name }}"
+  ansible.builtin.debug:
+    msg: >-
+      ✓ {{ op.name }} installed — channel {{ resolved_channel }}
+      ({{ channel_origin }}) from {{ resolved_catalog }},
+      namespace {{ op.namespace }}

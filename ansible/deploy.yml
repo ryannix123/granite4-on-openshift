@@ -6,22 +6,25 @@
 # and you're already logged in.
 #
 # Prerequisites:
-#   - The four operators below must already be installed (manually from
-#     OperatorHub):
-#       * Node Feature Discovery Operator
-#       * NVIDIA GPU Operator
-#       * Red Hat OpenShift AI Operator
-#       * OpenShift Lightspeed Operator
 #   - `oc` CLI in PATH, already logged in as cluster-admin
 #   - ansible-core 2.14+
 #   - The OCI model image already built and pushed to Quay
 #     (see ../build.sh)
 #
+# The four operators below are installed automatically if missing:
+#       * Node Feature Discovery Operator
+#       * NVIDIA GPU Operator
+#       * Red Hat OpenShift AI Operator
+#       * OpenShift Lightspeed Operator
+#   Set install_operators=false to restore the old behavior (verify only,
+#   fail with instructions if any are missing).
+#
 # Usage:
 #   ansible-playbook -i inventory/hosts.ini deploy.yml
 #
 # Tags (run just one phase):
-#   --tags detect    -- GPU detection only
+#   --tags detect    -- GPU detection only (never changes the cluster)
+#   --tags operators -- Install/verify the four operators only
 #   --tags gpu       -- NFD + GPU Operator + CUDA validation
 #   --tags rhoai     -- DataScienceCluster
 #   --tags model     -- Namespace + ServingRuntime + InferenceService
@@ -44,6 +47,7 @@
       register: oc_version
       changed_when: false
       failed_when: oc_version.rc != 0
+      check_mode: false
       tags: [always]
 
     - name: "Preflight | Verify logged in"
@@ -52,6 +56,7 @@
       register: oc_whoami
       changed_when: false
       failed_when: oc_whoami.rc != 0
+      check_mode: false
       tags: [always]
 
     - name: "Preflight | Show current user and cluster"
@@ -59,6 +64,7 @@
         cmd: "{{ item }}"
       register: cluster_info
       changed_when: false
+      check_mode: false
       loop:
         - "oc whoami"
         - "oc whoami --show-server"
@@ -71,38 +77,162 @@
           - "Cluster:      {{ cluster_info.results[1].stdout }}"
       tags: [always]
 
-    - name: "Preflight | Verify required operator CRDs are installed"
+    - name: "Preflight | Verify cluster-admin (needed to subscribe operators)"
       ansible.builtin.command:
-        cmd: "oc get crd {{ item }}"
+        cmd: oc auth can-i create subscriptions.operators.coreos.com --all-namespaces
+      register: can_subscribe
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: "Preflight | Check which required operator CRDs are present"
+      ansible.builtin.command:
+        cmd: "oc get crd {{ item.crd }}"
       register: crd_check
       changed_when: false
       failed_when: false
-      loop:
-        - "nodefeaturediscoveries.nfd.openshift.io"
-        - "clusterpolicies.nvidia.com"
-        - "datascienceclusters.datasciencecluster.opendatahub.io"
-        - "olsconfigs.ols.openshift.io"
+      check_mode: false
+      loop: "{{ required_operators }}"
+      loop_control:
+        label: "{{ item.name }}"
       tags: [always]
 
-    - name: "Preflight | Fail with helpful message if any operator CRD is missing"
+    - name: "Preflight | Build the list of operators that need installing"
+      ansible.builtin.set_fact:
+        missing_operators: "{{ crd_check.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}"
+      tags: [always]
+
+    - name: "Preflight | Report operator status"
+      ansible.builtin.debug:
+        msg: >-
+          {{ (required_operators | length) - (missing_operators | length) }}
+          of {{ required_operators | length }} required operators already
+          installed.
+          {% if missing_operators | length > 0 %}
+          Missing: {{ missing_operators | map(attribute='name') | join(', ') }}.
+          {% endif %}
+      tags: [always]
+
+
+    ############################################################################
+    # PHASE O: Install any missing operators via OLM.
+    #
+    # Deliberately NOT tagged `always` — `--tags detect` must never change
+    # the cluster. Every other tag pulls this block in, because every other
+    # phase applies a CR that one of these operators owns.
+    ############################################################################
+
+    - name: "Phase O | Operator installation"
+      when:
+        - missing_operators | length > 0
+        - install_operators | bool
+      tags: [operators, gpu, rhoai, model, ols, validate]
+      block:
+
+        - name: "Phase O | Fail early if the account cannot create Subscriptions"
+          ansible.builtin.fail:
+            msg: |
+              {{ missing_operators | length }} operator(s) need installing, but
+              this account cannot create Subscriptions cluster-wide.
+
+              Either log in as cluster-admin, or run with:
+                -e install_operators=false
+              and have someone install these from OperatorHub first:
+              {% for op in missing_operators %}
+                - {{ op.name }}
+              {% endfor %}
+          when: can_subscribe.stdout | default('no') | trim != 'yes'
+
+        - name: "Phase O | Wait for CatalogSources to be READY"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - catalogsource
+              - -n
+              - openshift-marketplace
+              - -o
+              - 'jsonpath={range .items[*]}{.metadata.name}|{.status.connectionState.lastObservedState}{"\n"}{end}'
+          register: catalog_state
+          changed_when: false
+          check_mode: false
+          # `until` controls the retry loop; `failed_when` mirrors it so that
+          # exhausting the retries is a hard failure. Without failed_when a
+          # spent until-loop reports "ok" and execution silently continues.
+          vars:
+            catalogs_ready: >-
+              {{ catalog_state.stdout_lines | default([])
+                 | select('match', '^(' ~ (missing_operators | map(attribute='catalog_source') | unique | join('|')) ~ ')\|READY$')
+                 | list | length == (missing_operators | map(attribute='catalog_source') | unique | list | length) }}
+          until: catalogs_ready | bool
+          failed_when: not (catalogs_ready | bool)
+          retries: 30
+          delay: 10
+
+        - name: "Phase O | Create a scratch dir for rendered subscriptions"
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: -operators
+          register: operator_render_dir
+          changed_when: false
+
+        - name: "Phase O | Install each missing operator, in dependency order"
+          ansible.builtin.include_tasks: tasks/install-operators.yml
+          loop: "{{ missing_operators }}"
+          loop_control:
+            loop_var: op
+            label: "{{ op.name }}"
+
+        - name: "Phase O | Re-check operator CRDs after installation"
+          ansible.builtin.command:
+            cmd: "oc get crd {{ item.crd }}"
+          register: crd_recheck
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          loop: "{{ required_operators }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "Phase O | Fail if anything is still missing"
+          ansible.builtin.fail:
+            msg: |
+              Operator installation ran, but these CRDs are still absent:
+              {% for r in crd_recheck.results %}{% if r.rc != 0 %}  - {{ r.item.crd }} ({{ r.item.name }})
+              {% endif %}{% endfor %}
+              Check the subscriptions and install plans:
+                oc get sub,ip,csv -A | grep -Ev 'Succeeded|Complete'
+          when:
+            - not ansible_check_mode
+            - crd_recheck.results | selectattr('rc', 'ne', 0) | list | length > 0
+
+      always:
+
+        - name: "Phase O | Clean up the scratch dir"
+          ansible.builtin.file:
+            path: "{{ operator_render_dir.path }}"
+            state: absent
+          when: operator_render_dir.path is defined
+          changed_when: false
+
+    - name: "Phase O | Fail with helpful message when auto-install is disabled"
       ansible.builtin.fail:
         msg: |
-          One or more required operators are not installed on this cluster.
+          One or more required operators are not installed on this cluster,
+          and install_operators is false.
 
-          Missing CRDs:
-          {% for r in crd_check.results %}{% if r.rc != 0 %}  - {{ r.item }}
-          {% endif %}{% endfor %}
+          Missing:
+          {% for op in missing_operators %}  - {{ op.name }} (CRD: {{ op.crd }})
+          {% endfor %}
 
-          Install the following from OperatorHub:
-            - Node Feature Discovery Operator
-            - NVIDIA GPU Operator
-            - Red Hat OpenShift AI
-            - OpenShift Lightspeed Operator
-
-          Once all four show Succeeded in Installed Operators, re-run:
-            ansible-playbook -i inventory/hosts.ini deploy.yml
-      when: crd_check.results | selectattr('rc', 'ne', 0) | list | length > 0
-      tags: [always]
+          Install them from OperatorHub, or re-run with automatic
+          installation enabled:
+            ansible-playbook -i inventory/hosts.ini deploy.yml -e install_operators=true
+      when:
+        - missing_operators | length > 0
+        - not (install_operators | bool)
+      tags: [operators, gpu, rhoai, model, ols, validate]
 
 
     ############################################################################
@@ -114,6 +244,7 @@
         cmd: oc get nodes -o jsonpath={.items[0].metadata.name}
       register: node_name
       changed_when: false
+      check_mode: false
       tags: [detect, gpu]
 
     - name: "Phase 0 | Run lspci on the node via oc debug"
@@ -123,6 +254,7 @@
           chroot /host lspci -nn 2>/dev/null | grep -iE 'vga|3d|display' || true
       register: lspci_output
       changed_when: false
+      check_mode: false
       tags: [detect, gpu]
 
     - name: "Phase 0 | Show raw lspci output"
@@ -193,7 +325,9 @@
           -o jsonpath='{.metadata.labels.feature\.node\.kubernetes\.io/pci-{{ nvidia_pci_vendor_id }}\.present}'
       register: nfd_label
       changed_when: false
+      check_mode: false
       until: nfd_label.stdout == "true"
+      failed_when: nfd_label.stdout != "true"
       retries: 18
       delay: 10
       tags: [gpu]
@@ -213,7 +347,9 @@
           -o jsonpath={.items[0].metadata.name}
       register: driver_pod_exists
       changed_when: false
+      check_mode: false
       until: driver_pod_exists.rc == 0 and driver_pod_exists.stdout | length > 0
+      failed_when: not (driver_pod_exists.rc == 0 and driver_pod_exists.stdout | length > 0)
       retries: 30
       delay: 10
       tags: [gpu]
@@ -236,7 +372,9 @@
           -o jsonpath={.items[0].metadata.name}
       register: device_plugin_exists
       changed_when: false
+      check_mode: false
       until: device_plugin_exists.rc == 0 and device_plugin_exists.stdout | length > 0
+      failed_when: not (device_plugin_exists.rc == 0 and device_plugin_exists.stdout | length > 0)
       retries: 30
       delay: 10
       tags: [gpu]
@@ -277,6 +415,20 @@
     # PHASE 2: RHOAI DataScienceCluster.
     ############################################################################
 
+    - name: "Phase 2 | Wait for the default DSCInitialization to be Ready"
+      ansible.builtin.command:
+        cmd: >
+          oc get dscinitialization default-dsci
+          -o jsonpath={.status.phase}
+      register: dsci_phase
+      changed_when: false
+      check_mode: false
+      until: dsci_phase.rc == 0 and dsci_phase.stdout == "Ready"
+      failed_when: not (dsci_phase.rc == 0 and dsci_phase.stdout == "Ready")
+      retries: 30
+      delay: 10
+      tags: [rhoai]
+
     - name: "Phase 2 | Apply DataScienceCluster"
       ansible.builtin.command:
         cmd: "oc apply -f {{ manifests_dir }}/03-dsc.yaml"
@@ -284,15 +436,96 @@
       changed_when: "'unchanged' not in dsc_apply.stdout"
       tags: [rhoai]
 
-    - name: "Phase 2 | Wait for KServe controller to be Ready"
-      ansible.builtin.command:
-        cmd: >
-          oc wait --for=condition=Ready pod
-          -l control-plane=kserve-controller-manager
-          -n redhat-ods-applications
-          --timeout={{ timeout_operator_ready }}s
-      changed_when: false
+    # `oc wait` does NOT wait for resources to appear -- with zero matches it
+    # returns rc=1 ("no matching resources found") in milliseconds. RHOAI needs
+    # a minute or two after the DSC lands before KServe deployments exist, so
+    # poll for existence first, then wait on readiness.
+    #
+    # Discover the deployment by name rather than hardcoding a pod label:
+    # `control-plane=kserve-controller-manager` is not stable across RHOAI
+    # versions, and a wrong selector fails exactly the same way as "too early",
+    # which makes it miserable to diagnose.
+    - name: "Phase 2 | Wait for KServe to be reconciled"
       tags: [rhoai]
+      block:
+
+        - name: "Phase 2 | Wait for the KServe controller deployment to appear"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - deployment
+              - -n
+              - redhat-ods-applications
+              - -o
+              - 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+          register: rhoai_deployments
+          changed_when: false
+          check_mode: false
+          vars:
+            kserve_present: >-
+              {{ rhoai_deployments.stdout_lines | default([])
+                 | select('search', 'kserve') | list | length > 0 }}
+          until: kserve_present | bool
+          failed_when: not (kserve_present | bool)
+          retries: 60
+          delay: 10
+
+        - name: "Phase 2 | Select the KServe controller deployment"
+          ansible.builtin.set_fact:
+            kserve_deployments: >-
+              {{ rhoai_deployments.stdout_lines
+                 | select('search', 'kserve-controller')
+                 | list
+                 | default(rhoai_deployments.stdout_lines
+                           | select('search', 'kserve') | list, true) }}
+
+        - name: "Phase 2 | Wait for KServe controller to be Available"
+          ansible.builtin.command:
+            cmd: >-
+              oc wait --for=condition=Available deployment/{{ item }}
+              -n redhat-ods-applications
+              --timeout={{ timeout_operator_ready }}s
+          changed_when: false
+          loop: "{{ kserve_deployments }}"
+
+      rescue:
+
+        - name: "Phase 2 | Dump DataScienceCluster status"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - datasciencecluster
+              - default-dsc
+              - -o
+              - 'jsonpath={range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}'
+          register: dsc_conditions
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: "Phase 2 | Report why KServe never came up"
+          ansible.builtin.fail:
+            msg: |
+              KServe did not become available in redhat-ods-applications.
+
+              Deployments currently in that namespace:
+              {% for d in rhoai_deployments.stdout_lines | default(['(none)'], true) %}
+                {{ d }}
+              {% endfor %}
+
+              DataScienceCluster conditions:
+              {% for line in dsc_conditions.stdout_lines | default(['(none reported)'], true) %}
+                {{ line }}
+              {% endfor %}
+
+              Check the RHOAI operator itself:
+                oc -n redhat-ods-operator logs -l name=rhods-operator --tail=100
+                oc get dsc default-dsc -o yaml
+
+              If kserve shows managementState Removed, fix
+              manifests/03-dsc.yaml and re-run with --tags rhoai.
 
 
     ############################################################################
@@ -319,6 +552,124 @@
       register: isvc_apply
       changed_when: "'unchanged' not in isvc_apply.stdout"
       tags: [model]
+
+    # Cross-manifest name references are the single easiest thing to break
+    # when renaming a model, and KServe fails silently on them: an unresolvable
+    # `runtime:` produces no Deployment, no pod, and no event -- just an
+    # InferenceService sitting there looking fine. Catch it in one second here
+    # rather than after a five-minute poll for a pod that will never exist.
+    - name: "Phase 3 | Read the runtime referenced by the InferenceService"
+      ansible.builtin.command:
+        cmd: >
+          oc get inferenceservice {{ inferenceservice_name }}
+          -n {{ serving_namespace }}
+          -o jsonpath={.spec.predictor.model.runtime}
+      register: isvc_runtime
+      changed_when: false
+      check_mode: false
+      tags: [model]
+
+    - name: "Phase 3 | List ServingRuntimes present in the namespace"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - servingruntime
+          - -n
+          - "{{ serving_namespace }}"
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}'
+      register: available_runtimes
+      changed_when: false
+      check_mode: false
+      tags: [model]
+
+    - name: "Phase 3 | Fail if the InferenceService references a missing ServingRuntime"
+      ansible.builtin.fail:
+        msg: |
+          InferenceService "{{ inferenceservice_name }}" references
+          ServingRuntime "{{ isvc_runtime.stdout }}", which does not exist in
+          namespace {{ serving_namespace }}.
+
+          ServingRuntimes that DO exist there:
+          {% for r in available_runtimes.stdout_lines | default(['(none)'], true) %}
+            {{ r }}
+          {% endfor %}
+
+          KServe will never create a Deployment for an unresolvable runtime,
+          so the predictor pod would never appear.
+
+          Fix the `runtime:` field in manifests/05-inferenceservice.yaml to
+          match the `metadata.name` in manifests/04-servingruntime.yaml, then
+          re-run with --tags model.
+      when:
+        - not ansible_check_mode
+        - isvc_runtime.stdout | length > 0
+        - isvc_runtime.stdout not in (available_runtimes.stdout_lines | default([]))
+      tags: [model]
+
+    # Same `oc wait` caveat as Phase 2: poll for the pod to exist before
+    # waiting on its condition, or a KServe reconcile lag reads as a hard
+    # failure in 150ms.
+    - name: "Phase 3 | Wait for the predictor pod"
+      tags: [model]
+      block:
+
+        - name: "Phase 3 | Wait for the predictor pod to be created"
+          ansible.builtin.command:
+            cmd: >
+              oc get pod -n {{ serving_namespace }}
+              -l serving.kserve.io/inferenceservice={{ inferenceservice_name }}
+              -o jsonpath={.items[0].metadata.name}
+          register: predictor_exists
+          changed_when: false
+          check_mode: false
+          until: predictor_exists.rc == 0 and (predictor_exists.stdout | length > 0)
+          failed_when: not (predictor_exists.rc == 0 and (predictor_exists.stdout | length > 0))
+          retries: 30
+          delay: 10
+
+      rescue:
+
+        - name: "Phase 3 | Dump InferenceService status"
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - inferenceservice
+              - "{{ inferenceservice_name }}"
+              - -n
+              - "{{ serving_namespace }}"
+              - -o
+              - 'jsonpath={range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}'
+          register: isvc_conditions
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: "Phase 3 | Report why the predictor never appeared"
+          ansible.builtin.fail:
+            msg: |
+              No predictor pod appeared for "{{ inferenceservice_name }}" in
+              namespace {{ serving_namespace }}.
+
+              InferenceService conditions:
+              {% for line in isvc_conditions.stdout_lines | default(['(none reported)'], true) %}
+                {{ line }}
+              {% endfor %}
+
+              Referenced runtime: {{ isvc_runtime.stdout | default('(unknown)') }}
+              Runtimes available: {{ available_runtimes.stdout_lines | default([]) | join(', ') | default('(none)', true) }}
+
+              Dig further with:
+                oc describe isvc {{ inferenceservice_name }} -n {{ serving_namespace }}
+                oc get deploy,rs -n {{ serving_namespace }}
+                oc get events -n {{ serving_namespace }} --sort-by=.lastTimestamp | tail -20
+
+              If a Deployment exists but has no pods, it is usually
+              unschedulable -- check that nvidia.com/gpu capacity is
+              advertised on the node:
+                oc get node -o jsonpath='{.items[0].status.allocatable}'
 
     - name: "Phase 3 | Wait for predictor pod to be Ready (5-10 min for OCI pull + model load)"
       ansible.builtin.command:
@@ -375,6 +726,66 @@
         cmd: "oc apply -f {{ manifests_dir }}/07-olsconfig.yaml"
       register: ols_apply
       changed_when: "'unchanged' not in ols_apply.stdout"
+      tags: [ols]
+
+    # Same class of failure as the Phase 3 runtime check: OLSConfig points at
+    # a Secret by name, and a rename that lands in one file but not the other
+    # produces an operator that reconciles quietly and an app server that
+    # never becomes ready. Compare the reference against the cluster.
+    - name: "Phase 4 | Read the credentials secret referenced by OLSConfig"
+      ansible.builtin.command:
+        cmd: >
+          oc get olsconfig cluster
+          -o jsonpath={.spec.llm.providers[0].credentialsSecretRef.name}
+      register: ols_secret_ref
+      changed_when: false
+      check_mode: false
+      tags: [ols]
+
+    - name: "Phase 4 | Check that the referenced secret exists"
+      ansible.builtin.command:
+        cmd: >
+          oc get secret {{ ols_secret_ref.stdout }}
+          -n openshift-lightspeed
+      register: ols_secret_present
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: ols_secret_ref.stdout | length > 0
+      tags: [ols]
+
+    - name: "Phase 4 | Fail if OLSConfig references a missing secret"
+      ansible.builtin.fail:
+        msg: |
+          OLSConfig references credentials secret
+          "{{ ols_secret_ref.stdout }}" in namespace openshift-lightspeed,
+          but no such secret exists.
+
+          The `credentialsSecretRef.name` in manifests/07-olsconfig.yaml must
+          match `metadata.name` in manifests/06-ols-secret.yaml. Both should
+          be "granite-creds".
+
+          Secrets currently in that namespace:
+            oc get secret -n openshift-lightspeed
+      when:
+        - not ansible_check_mode
+        - ols_secret_ref.stdout | length > 0
+        - ols_secret_present.rc | default(1) != 0
+      tags: [ols]
+
+    - name: "Phase 4 | Wait for the lightspeed-app-server pod to be created"
+      ansible.builtin.command:
+        cmd: >
+          oc get pod -n openshift-lightspeed
+          -l app.kubernetes.io/component=application-server
+          -o jsonpath={.items[0].metadata.name}
+      register: ols_pod_exists
+      changed_when: false
+      check_mode: false
+      until: ols_pod_exists.rc == 0 and (ols_pod_exists.stdout | length > 0)
+      failed_when: not (ols_pod_exists.rc == 0 and (ols_pod_exists.stdout | length > 0))
+      retries: 30
+      delay: 10
       tags: [ols]
 
     - name: "Phase 4 | Wait for lightspeed-app-server to be Ready"
