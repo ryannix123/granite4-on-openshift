@@ -57,8 +57,15 @@ even the "Effective 2B" variant consumes ~9.5 GB. On an 8 GB consumer
 GPU, no quantization or offloading strategy fits any Gemma 4 model
 via vLLM.
 
-IBM Granite 4.1 3B is a **dense** 3B-parameter model (~6.4 GB in
-bf16) that fits on 8 GB VRAM with room for a 4K-token KV cache. It
+IBM Granite 4.1 3B is a **dense** 3B-parameter model that fits on
+8 GB VRAM. This project serves IBM's official FP8 quantization
+(`ibm-granite/granite-4.1-3b-fp8`), which halves the weights from
+~6.4 GB to ~3.4 GB and leaves ~3.7 GB for the KV cache — enough for
+a 32k context window. In bf16 the same card affords only ~0.7 GB of
+KV cache, capping context near 9.7k, which is not enough once
+OpenShift Lightspeed starts injecting retrieved documentation into
+the prompt. The FP8 image is also half the size to mirror into a
+disconnected registry. It
 benchmarks competitively with much larger models on instruction
 following and tool calling (see the
 [Granite 4.1 blog post](https://research.ibm.com/blog/granite-4-1-ai-foundation-models)),
@@ -74,7 +81,7 @@ change.
 - Single Node OpenShift 4.19+ (required for RHOAI 3.x)
 - 12th Gen Intel i9 (or equivalent), 64 GB+ RAM recommended
 - NVIDIA RTX 3060 Ti (or any NVIDIA card with 8 GB+ VRAM)
-- ~20 GB free on default storage class for model image pull
+- ~10 GB free on default storage class for model image pull (~3.9 GB image)
 
 For a customer pilot, the target is a 3-node compact cluster with an
 L4 or L40S GPU worker. The YAML in this bundle changes minimally
@@ -98,7 +105,10 @@ under the hood — no extra Python dependencies, no SSH required.
 
 ## Prerequisites (do these first, in this order)
 
-1. **Install operators from OperatorHub** (in the web console):
+1. **Install operators.** The Ansible playbook installs all four
+   automatically if they are missing, so you can skip this step
+   entirely on the automated path. For the manual path, install them
+   from OperatorHub (in the web console):
    - Node Feature Discovery Operator
    - NVIDIA GPU Operator
    - Red Hat OpenShift AI — **select the `stable-3.x` channel**
@@ -167,7 +177,7 @@ oc apply -f manifests/04-servingruntime.yaml
 oc apply -f manifests/05-inferenceservice.yaml
 # Watch the predictor pod come up:
 oc -n llm-serving get pods -w
-# First start is slow: KServe pulls the OCI image (~6.4 GB), copies
+# First start is slow: KServe pulls the OCI image (~3.9 GB), copies
 # model files, vLLM loads the model. Expect 5-10 min.
 
 # SMOKE TEST the model directly before touching OLS:
@@ -213,11 +223,15 @@ podman login quay.io
 
 # Build and push
 chmod +x build.sh
-./build.sh v1
+./build.sh v2-fp8
 ```
 
-The script downloads ~6.4 GB of model weights from Hugging Face,
-builds a ~6.4 GB OCI image on top of UBI9-micro, and pushes to Quay.
+The script downloads ~3.4 GB of FP8 model weights from Hugging Face,
+builds a ~3.9 GB OCI image on top of UBI 10 micro, and pushes to Quay.
+
+> **Note:** `build.sh` skips the download if `model/config.json`
+> already exists. After changing `MODEL_ID`, `rm -rf model/` first or
+> you will repackage the previous weights under a new tag.
 
 **Tip:** If pushing from a Mac is slow or unreliable (iCloud competing
 for upload bandwidth, podman VM disk limits), push from a RHEL bastion
@@ -233,9 +247,12 @@ oc login ...                                    # log in to target cluster
 ansible-playbook -i inventory/hosts.ini deploy.yml
 ```
 
-That's it. The playbook runs every step above — including GPU
-detection via `oc debug node`, readiness waits, and the CUDA
-validation pod — as a single idempotent run. See
+That's it. The playbook runs every step above — including installing
+any missing operators via OLM, GPU detection via `oc debug node`,
+readiness waits, and the CUDA validation pod — as a single idempotent
+run. Operator channels are discovered from the cluster's own
+catalog rather than hardcoded. To skip operator installation and
+verify only, pass `-e install_operators=false`. See
 [`ansible/README.md`](ansible/README.md) for tags, troubleshooting,
 and teardown instructions.
 
@@ -254,19 +271,26 @@ and teardown instructions.
 The architecture is model-agnostic. To swap in a different model:
 
 1. Update `MODEL_ID` and `IMAGE_REPO` in `build.sh`.
-2. Run `./build.sh v1` to download, build, and push.
+2. Run `rm -rf model/ && ./build.sh <tag>` to download, build, and push.
 3. Update `storageUri` in `manifests/05-inferenceservice.yaml`.
 4. Update `--served-model-name` in `manifests/04-servingruntime.yaml`.
 5. Update `models[].name` in `manifests/07-olsconfig.yaml`.
 6. Adjust vLLM args (`--max-model-len`, `--gpu-memory-utilization`,
    etc.) based on the model's size and your GPU's VRAM.
-7. `oc apply` the updated manifests.
+7. Set `contextWindowSize` in `manifests/07-olsconfig.yaml` to the
+   **same value** as `--max-model-len`. If OLS believes the window is
+   larger than vLLM will accept, the first question in a conversation
+   succeeds and follow-ups fail once retrieved docs fill the prompt.
+8. Check whether the model's tool-call format matches the configured
+   `--tool-call-parser` (see Troubleshooting).
+9. `oc apply` the updated manifests.
 
 Models tested or considered during development:
 
 | Model | Type | Size (bf16) | Fits 8 GB? | Notes |
 |---|---|---|---|---|
-| **Granite 4.1 3B** | Dense | 6.4 GB | ✅ Yes | Current default. Best quality-to-size for 8 GB |
+| **Granite 4.1 3B FP8** | Dense | 3.4 GB | ✅ Yes | **Current default.** ~3.7 GB KV cache → 32k context |
+| Granite 4.1 3B (bf16) | Dense | 6.4 GB | ⚠️ Barely | Only ~0.7 GB KV cache → ~9.7k context ceiling |
 | Gemma 4 E4B | MoE | ~15 GB total | ❌ No | "Effective 4B" but MoE stores all experts in VRAM |
 | Gemma 4 E2B | MoE | ~9.5 GB total | ❌ No | Same MoE trap as E4B |
 | Granite 4.1 8B | Dense | ~16 GB | ❌ No | Great for L4/L40S production deployments |
@@ -284,7 +308,13 @@ Models tested or considered during development:
 | OLS "prompt exceeds maximum token limit" | Context window too small for OLS system prompt | Increase `--max-model-len` to 8192+ |
 | OLS "Connection error" to predictor | Port mismatch or service name wrong | Verify OLSConfig URL includes `:8080` and matches `oc get svc -n llm-serving` |
 | OLS pod can't reach predictor | Wrong service name/URL | Verify with `oc -n llm-serving get svc`; the service is `<isvc-name>-predictor` in RawDeployment mode |
-| Old ReplicaSet deadlocks new deployment | Rolling update can't schedule (GPU contention) | `oc scale replicaset -n llm-serving <old-rs> --replicas=0` then delete old pod |
+| Old ReplicaSet deadlocks new deployment | Rolling update can't schedule (GPU contention) | Set `deploymentStrategy.type: Recreate` in `05-inferenceservice.yaml`. To unstick now: `oc scale replicaset -n llm-serving <old-rs> --replicas=0` |
+| OLS answer shows raw `<tool_call>{...}</tool_call>` text | vLLM `--tool-call-parser` doesn't match the model's format | Granite 4.1 emits Hermes-style tags — use `--tool-call-parser=hermes`. The `granite` parser targets Granite 3.x's `<\|tool_call\|>` array format. Confirm with the model's own `chat_template.jinja` |
+| OLS: "prompt exceeds available context window limit 512" | `contextWindowSize` too small for OLS's own budgeting | OLS reserves 512 tokens for the response by default and needs far more declared headroom than the raw prompt. Raise `contextWindowSize` well above the prompt size |
+| First question works, follow-ups fail with token limit | `contextWindowSize` > vLLM `--max-model-len` | Make them equal. Turn 2 carries history plus turn 1's retrieved docs, which is what overflows |
+| Predictor pod never appears, no Deployment created | `runtime:` in the ISVC doesn't match a ServingRuntime name | `oc -n redhat-ods-applications logs deploy/kserve-controller-manager \| grep -i "No ServingRuntimes"`. The Ansible playbook catches this in ~1s |
+| vLLM: "estimated maximum model length is N" | KV cache too small for `--max-model-len` | Use FP8 weights (halves weight memory) or lower `--max-model-len` to N. `--max-num-seqs` does **not** change pool size in vLLM V1 |
+| `Marlin kernel` warning on startup | GPU lacks native FP8 compute (pre-Ada) | Expected on Ampere. Weight-only FP8 compression; memory savings kept, no throughput gain |
 
 ## Scaling up: from SNO/3060 Ti to L4/L40S pilot
 
@@ -299,9 +329,20 @@ things change:
    32768 or higher, raise `--max-num-seqs` to 16-32 for real
    concurrency. Raise memory limit to 64 Gi.
 
-3. **DSC**: Switch `kserve.defaultDeploymentMode` from `RawDeployment`
-   to `Serverless` if the customer wants scale-to-zero. Costs
-   Knative + Istio overhead but is the more "enterprise" pattern.
+3. **Deployment mode**: For scale-to-zero, switch from
+   `RawDeployment` to `Serverless`. In RHOAI 3.x this default lives in
+   the `inferenceservice-config` ConfigMap in `redhat-ods-applications`,
+   not in the DataScienceCluster — the v1 `kserve.defaultDeploymentMode`
+   field no longer exists in the v2 DSC API. Check the current value
+   with:
+
+   ```bash
+   oc get cm inferenceservice-config -n redhat-ods-applications \
+     -o jsonpath='{.data.deploy}'
+   ```
+
+   Serverless costs Knative + Istio overhead but is the more
+   "enterprise" pattern.
 
 That's it. The OLSConfig (`manifests/07-olsconfig.yaml`) doesn't
 change at all.
@@ -309,7 +350,6 @@ change at all.
 ## Repository layout
 
 ```
-.
 ├── manifests/
 │   ├── 00-namespace.yaml ........ llm-serving namespace
 │   ├── 01-nfd.yaml .............. NodeFeatureDiscovery instance
@@ -318,13 +358,29 @@ change at all.
 │   ├── 04-servingruntime.yaml ... vLLM ServingRuntime (Granite 4.1 compatible)
 │   ├── 05-inferenceservice.yaml . Granite 4.1 3B InferenceService
 │   ├── 06-ols-secret.yaml ....... Placeholder OLS credentials secret
-│   └── 07-olsconfig.yaml ........ OLSConfig pointing at the KServe predictor
+│   ├── 07-olsconfig.yaml ........ OLSConfig pointing at the KServe predictor
+│   └── 08-metrics.yaml .......... vLLM Prometheus metrics (applied manually)
 ├── ansible/
 │   ├── deploy.yml ............... Full deployment playbook (oc-based)
-│   ├── teardown.yml ............. Remove all CRs created by deploy.yml
+│   ├── teardown.yml ............. Remove CRs; optionally uninstall operators
 │   ├── README.md ................ Ansible-specific docs
 │   ├── inventory/hosts.ini ...... Localhost-only inventory
-│   └── group_vars/all.yml ....... Timeouts, GPU ID table, manifests dir
+│   ├── group_vars/all.yml ....... Operators, timeouts, GPU ID table
+│   ├── tasks/
+│   │   ├── install-operators.yml   Subscribe one operator via OLM and wait
+│   │   └── uninstall-operators.yml Remove one operator's Sub/CSV/OG/namespace
+│   └── templates/
+│       └── operator-subscription.yaml.j2  Namespace + OperatorGroup + Subscription
+├── tests/
+│   ├── README.md ................ How to run the OLS answer-quality suite
+│   ├── test-ols.yml ............. Ask OLS a question set, score the answers
+│   ├── test-questions.yml ....... Question bank for the above
+│   ├── test-tool-calling.yml .... Tool-calling capability suite
+│   ├── test-tool-calling-questions.yml  Question bank for tool calling
+│   └── ols-test-report example.json ... Sample JSON report output
+├── hummingbird/
+│   ├── Containerfile ............ Project Hummingbird distroless variant
+│   └── README.md ................ Hummingbird build notes
 ├── .github/workflows/
 │   └── build-model-image.yml .... CI/CD: build and push model image to Quay
 ├── images/
@@ -340,9 +396,26 @@ change at all.
 
 The repo includes a GitHub Actions workflow at
 `.github/workflows/build-model-image.yml` that rebuilds the model
-OCI image and pushes it to Quay. It runs on manual dispatch (with a
-user-supplied tag) and automatically on changes to `Containerfile` or
-`build.sh`.
+OCI image and pushes it to Quay. It runs three ways:
+
+| Trigger | Tags pushed |
+|---|---|
+| Manual dispatch (with a tag input) | `:<tag>` and `:hummingbird-<tag>` |
+| Push to `main` touching `Containerfile`, `hummingbird/Containerfile`, or `build.sh` | `:latest`, `:hummingbird-latest` — see note |
+| Weekly cron — Sundays 06:00 UTC | `:latest`, `:hummingbird-latest` |
+
+Pin `storageUri` to an explicit tag, never `:latest`. The scheduled
+rebuild re-downloads from Hugging Face and republishes `:latest` every
+week, so anything pinned there can change under a running deployment.
+
+> **Note:** the push trigger is configured for the `main` branch, but
+> this repo's default branch is `master`, so push builds never fire.
+> Only manual dispatch and the weekly cron currently run. Change
+> `on.push.branches` to `master` if you want push builds.
+
+> **Note:** `MODEL_ID` is defined in **two** places — the `env:` block
+> of the workflow and `build.sh`. Change both together or CI and local
+> builds will produce different images.
 
 To enable it, configure three secrets in your GitHub repo
 (Settings → Secrets and variables → Actions):
