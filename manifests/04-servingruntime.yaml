@@ -34,7 +34,7 @@ spec:
         - "--port=8080"
         - "--model=/mnt/models"
         - "--served-model-name=granite-41-3b"
-        - "--max-model-len=9216"
+        - "--max-model-len=32768"
         - "--max-num-seqs=4"
         - "--gpu-memory-utilization=0.95"
         - "--enforce-eager"

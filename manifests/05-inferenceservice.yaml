@@ -45,7 +45,7 @@ spec:
       runtime: vllm-granite
       # OCI image built from ./Containerfile, pushed to your Quay.
       # Update the tag as you iterate.
-      storageUri: oci://quay.io/ryan_nix/granite4-llm:v1
+      storageUri: oci://quay.io/ryan_nix/granite4-llm:v2-fp8
       resources:
         limits:
           nvidia.com/gpu: "1"
