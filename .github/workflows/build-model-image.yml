@@ -27,6 +27,14 @@ on:
         description: "Image tag (e.g. v1, v2)"
         required: true
         default: "v1"
+      model_id:
+        description: "Hugging Face model to build"
+        required: true
+        default: "ibm-granite/granite-4.1-3b"
+        type: choice
+        options:
+          - "ibm-granite/granite-4.1-3b"
+          - "ibm-granite/granite-4.2-3b"
   push:
     branches: [main]
     paths:
@@ -36,12 +44,9 @@ on:
 
 env:
   IMAGE_REPO: quay.io/ryan_nix/granite4-llm
-  # IBM's official FP8 quantization of granite-4.1-3b (Apache 2.0).
-  # Halves weight memory (~6.4 GiB -> ~3.2 GiB) so 32k context fits on an
-  # 8 GB card once OLS injects RAG chunks, and halves the image size for
-  # mirroring into a disconnected registry.
-  # NOTE: build.sh carries the same MODEL_ID. Change both together.
-  MODEL_ID: ibm-granite/granite-4.1-3b-fp8
+  # Default model for scheduled/push builds. Manual dispatch can override via
+  # the model_id input; the step below resolves the effective value.
+  DEFAULT_MODEL_ID: ibm-granite/granite-4.1-3b
 
 jobs:
   build-and-push:
@@ -82,13 +87,23 @@ jobs:
           login(token='${{ secrets.HF_TOKEN }}', add_to_git_credential=False)
           "
 
+      - name: Resolve model ID
+        id: model
+        run: |
+          MID="${{ github.event.inputs.model_id }}"
+          if [ -z "${MID}" ]; then
+            MID="${DEFAULT_MODEL_ID}"
+          fi
+          echo "id=${MID}" >> "$GITHUB_OUTPUT"
+          echo "Building model: ${MID}"
+
       - name: Download model weights
         run: |
           mkdir -p model
           python3 -c "
           from huggingface_hub import snapshot_download
           path = snapshot_download(
-              repo_id='${MODEL_ID}',
+              repo_id='${{ steps.model.outputs.id }}',
               local_dir='model',
               ignore_patterns=['*.gguf', '*.bin', 'original/*'],
           )
@@ -101,9 +116,9 @@ jobs:
           ls -lh model/
           SIZE=$(du -sb model/ | awk '{print $1}')
           echo "Total size: ${SIZE} bytes"
-          MIN=$((2 * 1024 * 1024 * 1024))   # FP8 weights are ~3.2 GB
+          MIN=$((3 * 1024 * 1024 * 1024))
           if [ "${SIZE}" -lt "${MIN}" ]; then
-            echo "ERROR: Model too small (< 2 GB). Download likely failed."
+            echo "ERROR: Model too small (< 3 GB). Download likely failed."
             exit 1
           fi
           echo "✓ Size check passed."
@@ -111,12 +126,23 @@ jobs:
       - name: Determine image tags
         id: tags
         run: |
+          # 4.2 builds get a granite42- prefix on every tag so they never
+          # overwrite the proven 4.1 :latest / :hummingbird-latest.
+          case "${{ steps.model.outputs.id }}" in
+            *granite-4.2-*) PREFIX="granite42-" ;;
+            *)              PREFIX="" ;;
+          esac
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "ubi_tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-            echo "hb_tag=hummingbird-${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            USER_TAG="${{ github.event.inputs.tag }}"
+            echo "ubi_tag=${PREFIX}${USER_TAG}" >> "$GITHUB_OUTPUT"
+            echo "hb_tag=${PREFIX}hummingbird-${USER_TAG}" >> "$GITHUB_OUTPUT"
+            echo "ubi_latest=${PREFIX}latest" >> "$GITHUB_OUTPUT"
+            echo "hb_latest=${PREFIX}hummingbird-latest" >> "$GITHUB_OUTPUT"
           else
-            echo "ubi_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "hb_tag=hummingbird-latest" >> "$GITHUB_OUTPUT"
+            echo "ubi_tag=${PREFIX}latest" >> "$GITHUB_OUTPUT"
+            echo "hb_tag=${PREFIX}hummingbird-latest" >> "$GITHUB_OUTPUT"
+            echo "ubi_latest=${PREFIX}latest" >> "$GITHUB_OUTPUT"
+            echo "hb_latest=${PREFIX}hummingbird-latest" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Log in to Quay.io
@@ -138,8 +164,8 @@ jobs:
       - name: "Push UBI 10 image"
         run: |
           podman push "${IMAGE_REPO}:${{ steps.tags.outputs.ubi_tag }}"
-          podman tag "${IMAGE_REPO}:${{ steps.tags.outputs.ubi_tag }}" "${IMAGE_REPO}:latest"
-          podman push "${IMAGE_REPO}:latest"
+          podman tag "${IMAGE_REPO}:${{ steps.tags.outputs.ubi_tag }}" "${IMAGE_REPO}:${{ steps.tags.outputs.ubi_latest }}"
+          podman push "${IMAGE_REPO}:${{ steps.tags.outputs.ubi_latest }}"
 
       # ── Hummingbird variant ─────────────────────────────────────
 
@@ -154,8 +180,8 @@ jobs:
       - name: "Push Hummingbird image"
         run: |
           podman push "${IMAGE_REPO}:${{ steps.tags.outputs.hb_tag }}"
-          podman tag "${IMAGE_REPO}:${{ steps.tags.outputs.hb_tag }}" "${IMAGE_REPO}:hummingbird-latest"
-          podman push "${IMAGE_REPO}:hummingbird-latest"
+          podman tag "${IMAGE_REPO}:${{ steps.tags.outputs.hb_tag }}" "${IMAGE_REPO}:${{ steps.tags.outputs.hb_latest }}"
+          podman push "${IMAGE_REPO}:${{ steps.tags.outputs.hb_latest }}"
 
       # ── Summary ─────────────────────────────────────────────────
 
@@ -166,11 +192,11 @@ jobs:
           echo ""
           echo "  UBI 10:"
           echo "    ${IMAGE_REPO}:${{ steps.tags.outputs.ubi_tag }}"
-          echo "    ${IMAGE_REPO}:latest"
+          echo "    ${IMAGE_REPO}:${{ steps.tags.outputs.ubi_latest }}"
           echo ""
           echo "  Hummingbird:"
           echo "    ${IMAGE_REPO}:${{ steps.tags.outputs.hb_tag }}"
-          echo "    ${IMAGE_REPO}:hummingbird-latest"
+          echo "    ${IMAGE_REPO}:${{ steps.tags.outputs.hb_latest }}"
           echo ""
           echo "  storageUri (UBI):         oci://${IMAGE_REPO}:${{ steps.tags.outputs.ubi_tag }}"
           echo "  storageUri (Hummingbird): oci://${IMAGE_REPO}:${{ steps.tags.outputs.hb_tag }}"

@@ -1,0 +1,46 @@
+---
+# 05-inferenceservice-granite42.yaml
+#
+# PARALLEL InferenceService for the Granite 4.2 3B reasoning model.
+#
+# This is a SEPARATE ISVC from granite-41-3b so you can A/B test or pivot
+# between versions. Run only ONE at a time on the 8 GB SNO GPU — both want
+# the whole card. To switch:
+#
+#   # stop 4.1, start 4.2
+#   oc annotate isvc granite-41-3b -n llm-serving serving.kserve.io/stop=true --overwrite
+#   oc apply -f manifests/05-inferenceservice-granite42.yaml
+#
+#   # ...or pivot back: stop 4.2, restart 4.1
+#   oc annotate isvc granite-42-3b -n llm-serving serving.kserve.io/stop=true --overwrite
+#   oc annotate isvc granite-41-3b -n llm-serving serving.kserve.io/stop-
+#
+# NOTE: OLSConfig points at a predictor Service DNS name. The 4.2 predictor
+# is granite-42-3b-predictor, so to send OLS to 4.2 you must update the
+# OLSConfig url to match (see manifests note below). That's the one manual
+# step when switching which model OLS talks to.
+
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: granite-42-3b
+  namespace: llm-serving
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "Granite 4.2 3B (reasoning)"
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: vLLM
+      runtime: vllm-granite
+      # Points at the 4.2 image tag. build-granite42.sh pushes this.
+      storageUri: oci://quay.io/ryan_nix/granite4-llm:granite42-latest
+      # served-model-name inside vLLM stays aligned to this ISVC name via
+      # the ServingRuntime args. If your ServingRuntime hardcodes
+      # --served-model-name=granite-41-3b, override it here so the model id
+      # OLS/clients use matches (see ServingRuntime note below).
+    minReplicas: 1
+    maxReplicas: 1

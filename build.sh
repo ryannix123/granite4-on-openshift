@@ -2,11 +2,16 @@
 # build.sh — Download model weights, build OCI ModelCar image, push to Quay.
 #
 # Usage:
-#   ./build.sh [TAG]
+#   ./build.sh [TAG] [MODEL_ID]
 #
 # Examples:
-#   ./build.sh v1          # tag as v1
-#   ./build.sh             # defaults to v1
+#   ./build.sh                          # Granite 4.1 3B, tag :v1 + :latest
+#   ./build.sh granite42-v1 ibm-granite/granite-4.2-3b
+#                                       # Granite 4.2 3B, tag :granite42-v1 + :granite42-latest
+#
+# Or use the convenience wrappers:
+#   ./build-granite41.sh                # builds 4.1 with the right tags
+#   ./build-granite42.sh                # builds 4.2 with the right tags
 #
 # Prerequisites:
 #   - python3 with huggingface_hub installed
@@ -15,23 +20,38 @@
 #   - Logged in to HF: hf auth login (or export HF_TOKEN)
 #
 # Compatible with macOS (zsh/bash) and Linux. Uses BSD-friendly flags.
+#
+# Both model versions live in the SAME Quay repo, distinguished by tag:
+#   granite-4.1-3b  ->  :v1 / :latest              (the proven default)
+#   granite-4.2-3b  ->  :granite42-v1 / :granite42-latest  (reasoning model)
+# This lets you pivot between them by changing only the storageUri tag in
+# manifests/05-inferenceservice.yaml — no separate repo, no rebuild churn.
 
 set -euo pipefail
 
-# IBM's official FP8 quantization of granite-4.1-3b (Apache 2.0).
-# Halves weight memory (~6.4 GiB -> ~3.2 GiB), which is what makes 32k
-# context fit on an 8 GB card once OLS starts injecting RAG chunks.
-# It also halves the ModelCar image size, which matters for mirroring
-# into a disconnected registry.
-MODEL_ID="ibm-granite/granite-4.1-3b-fp8"
+MODEL_ID="${2:-ibm-granite/granite-4.1-3b}"
 IMAGE_REPO="quay.io/ryan_nix/granite4-llm"
 TAG="${1:-v1}"
 
+# The "floating" convenience tag pushed alongside the explicit TAG.
+# For 4.2 builds we keep a separate floating tag so :latest always means
+# the proven 4.1 model unless you deliberately move it.
+case "${MODEL_ID}" in
+  *granite-4.2-*) FLOATING_TAG="granite42-latest" ;;
+  *)              FLOATING_TAG="latest" ;;
+esac
+
 BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
-MODEL_DIR="${BUILD_DIR}/model"
+# Version-specific model dir: a slug derived from the model ID. This keeps
+# 4.1 and 4.2 weights in separate directories so switching MODEL_ID never
+# reuses stale weights from the other version.
+MODEL_SLUG="$(echo "${MODEL_ID}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')"
+MODEL_DIR="${BUILD_DIR}/model-${MODEL_SLUG}"
 
 echo ">>> Build directory: ${BUILD_DIR}"
-echo ">>> Image: ${IMAGE_REPO}:${TAG}"
+echo ">>> Model ID:        ${MODEL_ID}"
+echo ">>> Image:           ${IMAGE_REPO}:${TAG}"
+echo ">>> Floating tag:    ${IMAGE_REPO}:${FLOATING_TAG}"
 
 # ---------------------------------------------------------------------------
 # 1. Download model from Hugging Face if not already present.
@@ -101,7 +121,7 @@ else
   MODEL_SIZE_BYTES=$(find "${MODEL_DIR}" -type f -exec stat --format=%s {} + | awk 'BEGIN{s=0} {s+=$1} END{print s}')
 fi
 
-MIN_EXPECTED_BYTES=$((2 * 1024 * 1024 * 1024))  # 2 GB floor (FP8 weights are ~3.2 GB)
+MIN_EXPECTED_BYTES=$((3 * 1024 * 1024 * 1024))  # 3 GB floor
 if [ "${MODEL_SIZE_BYTES:-0}" -lt "${MIN_EXPECTED_BYTES}" ]; then
   echo "" >&2
   echo "ERROR: Model directory is suspiciously small (< 3 GB)." >&2
@@ -120,7 +140,15 @@ echo ">>> Sanity check passed: model is ${MODEL_SIZE_BYTES} bytes ($(echo "scale
 
 # ---------------------------------------------------------------------------
 # 3. Build the image.
+#
+# The Containerfile copies from ./model (a fixed path in the build context).
+# We point ./model at the version-specific directory via a symlink so the
+# same Containerfile builds either version without edits.
 # ---------------------------------------------------------------------------
+echo ">>> Linking ${MODEL_DIR} -> ${BUILD_DIR}/model for the build context..."
+rm -f "${BUILD_DIR}/model"
+ln -s "${MODEL_DIR}" "${BUILD_DIR}/model"
+
 echo ">>> Building OCI image..."
 podman build \
   --platform linux/amd64 \
@@ -148,19 +176,19 @@ podman push \
   --retry-delay "${PUSH_RETRY_DELAY}" \
   "${IMAGE_REPO}:${TAG}"
 
-# 5. Also push the :latest tag for convenience.
-echo ">>> Tagging and pushing :latest..."
-podman tag "${IMAGE_REPO}:${TAG}" "${IMAGE_REPO}:latest"
+# 5. Also push the floating tag (:latest for 4.1, :granite42-latest for 4.2).
+echo ">>> Tagging and pushing :${FLOATING_TAG}..."
+podman tag "${IMAGE_REPO}:${TAG}" "${IMAGE_REPO}:${FLOATING_TAG}"
 podman push \
   --retry "${PUSH_RETRY_TIMES}" \
   --retry-delay "${PUSH_RETRY_DELAY}" \
-  "${IMAGE_REPO}:latest"
+  "${IMAGE_REPO}:${FLOATING_TAG}"
 
 # ---------------------------------------------------------------------------
 # Done.
 # ---------------------------------------------------------------------------
 echo ""
-echo ">>> Done. Image pushed to ${IMAGE_REPO}:${TAG} and ${IMAGE_REPO}:latest"
+echo ">>> Done. Image pushed to ${IMAGE_REPO}:${TAG} and ${IMAGE_REPO}:${FLOATING_TAG}"
 echo ">>> Update manifests/05-inferenceservice.yaml storageUri to:"
 echo ">>>   oci://${IMAGE_REPO}:${TAG}"
 echo ""

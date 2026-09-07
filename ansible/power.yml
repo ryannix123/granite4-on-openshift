@@ -33,6 +33,26 @@
 # `state=up` always restores the full stack regardless of scope, applying
 # only what is actually missing. There is no sensible reason to bring the
 # model back up but leave OLS pointing at nothing.
+#
+# MODEL SELECTOR: pass -e model=granite42 to operate on the Granite 4.2
+# InferenceService instead of the default 4.1. This controls BOTH which
+# ISVC is stopped on `down` and which manifest is applied on `up`, so a
+# `down` reliably frees the GPU no matter which model was running.
+#   -e model=granite41   -> granite-41-3b  + 05-inferenceservice.yaml   (default)
+#   -e model=granite42   -> granite-42-3b  + 05-inferenceservice-granite42.yaml
+#
+# To free the GPU regardless of which model is up, you can also just run
+# both downs, or use scope=rhoai which removes the DSC and drains all
+# predictors at once.
+#
+# NOTE on OLS + 4.2: this playbook starts/stops the selected predictor, but
+# 07-olsconfig.yaml still points OLS at the 4.1 predictor URL. To actually
+# route OLS to 4.2, patch the provider URL once (see GRANITE-4.2-SETUP.md):
+#   oc patch olsconfig cluster --type=json -p='[{"op":"replace",
+#     "path":"/spec/llm/providers/0/url",
+#     "value":"http://granite-42-3b-predictor.llm-serving.svc.cluster.local:8080/v1"}]'
+# For pure A/B testing you often don't need OLS at all — hit the predictor
+# directly with the test suite.
 
 - name: "Power the OLS + model serving stack up or down"
   hosts: local
@@ -41,10 +61,20 @@
   vars:
     state: status          # status | up | down
     scope: ols             # model | ols | rhoai
+    model: granite41       # granite41 | granite42
 
     ols_namespace: "openshift-lightspeed"
     rhoai_apps_namespace: "redhat-ods-applications"
     dsc_name: "default-dsc"
+
+    # Map the model selector to its ISVC name and manifest file. Defaults to
+    # 4.1 so all existing invocations behave exactly as before.
+    model_isvc:
+      granite41: "granite-41-3b"
+      granite42: "granite-42-3b"
+    model_manifest:
+      granite41: "05-inferenceservice.yaml"
+      granite42: "05-inferenceservice-granite42.yaml"
 
     # Seconds to wait for workloads to drain / come back.
     timeout_drain: 180
@@ -71,6 +101,21 @@
       ansible.builtin.fail:
         msg: 'scope must be one of: model, ols, rhoai (got "{{ scope }}").'
       when: scope not in ['model', 'ols', 'rhoai']
+      tags: [always]
+
+    - name: "Preflight | Validate the model argument"
+      ansible.builtin.fail:
+        msg: 'model must be one of: granite41, granite42 (got "{{ model }}").'
+      when: model not in ['granite41', 'granite42']
+      tags: [always]
+
+    - name: "Preflight | Resolve the active InferenceService and manifest"
+      ansible.builtin.set_fact:
+        # Override the group_vars default with the model-selected ISVC name,
+        # so every task below that references inferenceservice_name acts on
+        # the model the user actually asked for.
+        inferenceservice_name: "{{ model_isvc[model] }}"
+        active_isvc_manifest: "{{ model_manifest[model] }}"
       tags: [always]
 
     - name: "Preflight | Verify logged in"
@@ -271,7 +316,7 @@
         - name: "Down | Stopped"
           ansible.builtin.debug:
             msg:
-              - "✓ Stack stopped at scope '{{ scope }}'."
+              - "✓ Stack stopped at scope '{{ scope }}' (model: {{ model }} / {{ inferenceservice_name }})."
               - "  Model serving:  stopped (GPU released)"
               - "  OpenShift AI:   {{ 'DataScienceCluster removed' if touch_dsc | bool else 'left running' }}"
               - "  Lightspeed:     {{ 'stopped' if touch_ols | bool else 'left running' }}"
@@ -353,7 +398,7 @@
 
         - name: "Up | Restore InferenceService"
           ansible.builtin.command:
-            cmd: "oc apply -f {{ manifests_dir }}/05-inferenceservice.yaml"
+            cmd: "oc apply -f {{ manifests_dir }}/{{ active_isvc_manifest }}"
           register: isvc_apply
           changed_when: "'unchanged' not in isvc_apply.stdout"
 
@@ -421,6 +466,6 @@
         - name: "Up | Started"
           ansible.builtin.debug:
             msg:
-              - "✓ Stack restored."
+              - "✓ Stack restored (model: {{ model }} / {{ inferenceservice_name }})."
               - "  Ask a question from the console's Lightspeed panel to confirm."
               - "  Watch vLLM:  oc -n {{ serving_namespace }} logs -f deployment/{{ inferenceservice_name }}-predictor"
