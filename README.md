@@ -306,6 +306,21 @@ ansible-playbook -i inventory/hosts.ini power.yml -e state=up
 | `ols` *(default)* | + OLSConfig | App server, Postgres, and the Solr/RHOKP retrieval pod |
 | `rhoai` | + DataScienceCluster | KServe controllers and the RHOAI dashboard |
 
+By default `power.yml` operates on the Granite 4.1 InferenceService.
+To power the Granite 4.2 InferenceService instead (see "Trying
+Granite 4.2" below), add `-e model=granite42` to any `up`/`down`
+command — this controls both which predictor is stopped and which
+manifest is applied on restart, so a `down` reliably frees the GPU
+no matter which model was running:
+
+```bash
+# Stop whichever 4.2 predictor is up (frees the GPU for VMs, etc.)
+ansible-playbook -i inventory/hosts.ini power.yml -e state=down -e model=granite42
+
+# Bring the 4.2 stack back
+ansible-playbook -i inventory/hosts.ini power.yml -e state=up -e model=granite42
+```
+
 **Why it deletes custom resources instead of scaling deployments.**
 KServe and the Lightspeed operator both reconcile their workloads, so
 a hand-scaled Deployment comes straight back. Deleting the
@@ -359,6 +374,26 @@ Models tested or considered during development:
 | Gemma 4 E2B | MoE | ~9.5 GB total | ❌ No | Same MoE trap as E4B |
 | Granite 4.1 8B | Dense | ~16 GB | ❌ No | Great for L4/L40S production deployments |
 | Llama 3.2 3B | Dense | ~6 GB | ✅ Yes | Alternative; Meta Community License |
+
+## Trying Granite 4.2 (experimental)
+
+Granite 4.2 3B (IBM's reasoning/"thinking" model in the same size
+class) can be built and served alongside 4.1 for A/B testing, without
+disturbing the proven 4.1 setup. The two live in the same Quay repo,
+distinguished by tag, and `:latest` always stays on 4.1.
+
+- **Build:** `./build-granite42.sh` (pushes `:granite42-v1` and
+  `:granite42-latest`), or trigger the CI/CD workflow manually and pick
+  `ibm-granite/granite-4.2-3b` from the `model_id` dropdown.
+- **Serve:** `oc apply -f manifests/05-inferenceservice-granite42.yaml`
+  (a separate `granite-42-3b` InferenceService). Only one model fits on
+  the 8 GB card at a time — stop one before starting the other.
+- **Switch / roll back / A-B**, plus the two things to verify on the
+  4.2 bring-up (served-model-name and tool-call parser), are in
+  [GRANITE-4.2-SETUP.md](GRANITE-4.2-SETUP.md).
+
+This path is experimental and unverified on this hardware until
+tested — 4.1 FP8 remains the documented default above.
 
 ## Troubleshooting matrix
 
@@ -415,72 +450,80 @@ change at all.
 
 ```
 ├── manifests/
-│   ├── 00-namespace.yaml ........ llm-serving namespace
-│   ├── 01-nfd.yaml .............. NodeFeatureDiscovery instance
-│   ├── 02-gpu-clusterpolicy.yaml  NVIDIA GPU Operator config
-│   ├── 03-dsc.yaml .............. RHOAI DataScienceCluster (trimmed for SNO)
-│   ├── 04-servingruntime.yaml ... vLLM ServingRuntime (Granite 4.1 compatible)
-│   ├── 05-inferenceservice.yaml . Granite 4.1 3B InferenceService
-│   ├── 06-ols-secret.yaml ....... Placeholder OLS credentials secret
-│   ├── 07-olsconfig.yaml ........ OLSConfig pointing at the KServe predictor
-│   └── 08-metrics.yaml .......... vLLM Prometheus metrics (applied manually)
+│   ├── 00-namespace.yaml ................ llm-serving namespace
+│   ├── 01-nfd.yaml ...................... NodeFeatureDiscovery instance
+│   ├── 02-gpu-clusterpolicy.yaml ........ NVIDIA GPU Operator config
+│   ├── 03-dsc.yaml ...................... RHOAI DataScienceCluster (trimmed for SNO)
+│   ├── 04-servingruntime.yaml ........... vLLM ServingRuntime (Granite 4.1 compatible)
+│   ├── 05-inferenceservice.yaml ......... Granite 4.1 3B InferenceService
+│   ├── 05-inferenceservice-granite42.yaml  Granite 4.2 3B InferenceService (experimental)
+│   ├── 06-ols-secret.yaml ............... Placeholder OLS credentials secret
+│   ├── 07-olsconfig.yaml ................ OLSConfig pointing at the KServe predictor
+│   └── 08-metrics.yaml .................. vLLM Prometheus metrics (applied manually)
 ├── ansible/
-│   ├── deploy.yml ............... Full deployment playbook (oc-based)
-│   ├── power.yml ................ Stop/start the stack to reclaim RAM + GPU
-│   ├── teardown.yml ............. Remove CRs; optionally uninstall operators
-│   ├── README.md ................ Ansible-specific docs
-│   ├── inventory/hosts.ini ...... Localhost-only inventory
-│   ├── group_vars/all.yml ....... Operators, timeouts, GPU ID table
+│   ├── deploy.yml ....................... Full deployment playbook (oc-based)
+│   ├── power.yml ........................ Stop/start the stack to reclaim RAM + GPU
+│   ├── teardown.yml ..................... Remove CRs; optionally uninstall operators
+│   ├── README.md ........................ Ansible-specific docs
+│   ├── inventory/hosts.ini .............. Localhost-only inventory
+│   ├── group_vars/all.yml ............... Operators, timeouts, GPU ID table
 │   ├── tasks/
-│   │   ├── install-operators.yml   Subscribe one operator via OLM and wait
-│   │   └── uninstall-operators.yml Remove one operator's Sub/CSV/OG/namespace
+│   │   ├── install-operators.yml ....... Subscribe one operator via OLM and wait
+│   │   └── uninstall-operators.yml ..... Remove one operator's Sub/CSV/OG/namespace
 │   └── templates/
 │       └── operator-subscription.yaml.j2  Namespace + OperatorGroup + Subscription
 ├── tests/
-│   ├── README.md ................ How to run the OLS answer-quality suite
-│   ├── test-ols.yml ............. Ask OLS a question set, score the answers
-│   ├── test-questions.yml ....... Question bank for the above
-│   ├── test-tool-calling.yml .... Tool-calling capability suite
-│   ├── test-tool-calling-questions.yml  Question bank for tool calling
-│   └── ols-test-report example.json ... Sample JSON report output
+│   ├── README.md ........................ How to run the OLS answer-quality suite
+│   ├── test-ols.yml ..................... Ask OLS a question set, score the answers
+│   ├── test-questions.yml ............... Question bank for the above
+│   ├── test-tool-calling.yml ............ Tool-calling capability suite
+│   ├── test-tool-calling-questions.yml .. Question bank for tool calling
+│   └── ols-test-report example.json ..... Sample JSON report output
 ├── hummingbird/
-│   ├── Containerfile ............ Project Hummingbird distroless variant
-│   └── README.md ................ Hummingbird build notes
+│   ├── Containerfile .................... Project Hummingbird distroless variant
+│   └── README.md ........................ Hummingbird build notes
 ├── .github/workflows/
-│   └── build-model-image.yml .... CI/CD: build and push model image to Quay
+│   └── build-model-image.yml ............ CI/CD: build and push model image to Quay
 ├── images/
-│   └── logo.jpg ................. Project logo
-├── Containerfile ................ OCI ModelCar image definition
-├── build.sh ..................... HF download + image build + Quay push
-├── ARCHITECTURE.md .............. Namespace and component architecture
+│   └── logo.jpg ......................... Project logo
+├── Containerfile ........................ OCI ModelCar image definition
+├── build.sh ............................. HF download + image build + Quay push
+├── build-granite41.sh ................... Wrapper: build Granite 4.1 (:v1 / :latest)
+├── build-granite42.sh ................... Wrapper: build Granite 4.2 (:granite42-*)
+├── GRANITE-4.2-SETUP.md ................. Dual-model build, switch, and A/B guide
+├── ARCHITECTURE.md ...................... Namespace and component architecture
 ├── .gitignore
-└── README.md .................... This file
+└── README.md ............................ This file
 ```
 
 ## CI/CD
 
 The repo includes a GitHub Actions workflow at
-`.github/workflows/build-model-image.yml` that rebuilds the model
-OCI image and pushes it to Quay. It runs three ways:
+`.github/workflows/build-model-image.yml` that builds the model OCI
+image (both UBI 10 and Project Hummingbird variants) and pushes them
+to Quay. It runs three ways:
 
-| Trigger | Tags pushed |
-|---|---|
-| Manual dispatch (with a tag input) | `:<tag>` and `:hummingbird-<tag>` |
-| Push to `main` touching `Containerfile`, `hummingbird/Containerfile`, or `build.sh` | `:latest`, `:hummingbird-latest` — see note |
-| Weekly cron — Sundays 06:00 UTC | `:latest`, `:hummingbird-latest` |
+| Trigger | What it builds | Tags pushed |
+|---|---|---|
+| Manual dispatch | The model picked from the `model_id` dropdown, with your `tag` input | `:<tag>` + `:latest` (and `hummingbird-` variants) for 4.1; `:granite42-<tag>` + `:granite42-latest` for 4.2 |
+| Push to `master` touching `Containerfile`, `hummingbird/Containerfile`, or `build.sh` | Granite 4.1 (the default) | `:latest`, `:hummingbird-latest` |
+| Weekly cron — Sundays 06:00 UTC | Granite 4.1 (the default) | `:latest`, `:hummingbird-latest` |
+
+**Building Granite 4.2:** there is no automatic path — it is always a
+deliberate manual dispatch. In the repo's **Actions** tab, choose
+**"Build and push model images" → "Run workflow"**, set **model_id** to
+`ibm-granite/granite-4.2-3b` and a **tag** (e.g. `v1`), and run it. All
+4.2 tags are automatically prefixed with `granite42-`, so a 4.2 build
+**never overwrites** the proven 4.1 `:latest` or `:hummingbird-latest`.
 
 Pin `storageUri` to an explicit tag, never `:latest`. The scheduled
 rebuild re-downloads from Hugging Face and republishes `:latest` every
 week, so anything pinned there can change under a running deployment.
 
-> **Note:** the push trigger is configured for the `main` branch, but
-> this repo's default branch is `master`, so push builds never fire.
-> Only manual dispatch and the weekly cron currently run. Change
-> `on.push.branches` to `master` if you want push builds.
-
-> **Note:** `MODEL_ID` is defined in **two** places — the `env:` block
-> of the workflow and `build.sh`. Change both together or CI and local
-> builds will produce different images.
+> **Note:** the default model for scheduled and push-triggered builds is
+> set via `DEFAULT_MODEL_ID` in the workflow's `env:` block, and
+> separately as `MODEL_ID` in `build.sh` for local builds. Change both
+> together or CI and local builds will produce different images.
 
 To enable it, configure three secrets in your GitHub repo
 (Settings → Secrets and variables → Actions):
